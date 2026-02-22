@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <domain-config>
+        <domain name="example.com" includeSubdomains="true">
+            <path-list>
+                <path-element path="signin/forgot-password" requireUserAction="true" />
+            </path-list>
+        </domain>
+        <!--
+        `android:path` specifies datatype of url
+        `requireUserAction` specifies prompt managed browser
+        if fingerprint feature in app, set to true
+        -->
+    </domain-config>
+</data-extraction-rules>

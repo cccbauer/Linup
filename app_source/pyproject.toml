@@ -1,0 +1,12 @@
+[project]
+name = "Linup"
+version = "1.0.0"
+description = "Linup Roulette Tracker"
+requires-python = ">=3.10"
+dependencies = ["flet"]
+
+[tool.flet]
+org = "com.tuempresa"
+product = "Linup"
+company = "Tu Empresa"
+icon = "icon.png"

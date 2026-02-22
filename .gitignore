@@ -1,0 +1,21 @@
+# Gradle
+.gradle/
+build/
+*.apk
+*.aar
+
+# Android Studio
+.idea/
+*.iml
+*.iws
+*.ipr
+.DS_Store
+local.properties
+
+# Project specific
+/captures
+.externalNativeBuild
+.cxx
+
+# Kotlin
+*.kt.bak
