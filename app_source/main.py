@@ -177,6 +177,7 @@ class LinupApp:
         self.idx_fibo_in          = 0
         self.nivel_martingala_in  = 0
         self.last_bet_outside     = None
+        self.stop_loss_triggered  = False
         self.activa               = False
         self.grupos_activos   = []
         self.history_nums     = []
@@ -232,7 +233,7 @@ class LinupApp:
     def handle_show_history(self, e=None):
         rows = []
         total_profit   = 0.0
-        total_ini      = 0.0
+        total_efec     = 0.0
         conn = self._get_conn()
         if conn:
             try:
@@ -251,7 +252,7 @@ class LinupApp:
                     b_ini   = b_ini or b_final or 1.0
                     profit  = profit or 0.0
                     total_profit += profit
-                    total_ini    += b_ini
+                    total_efec   += (profit / b_ini * 100) if b_ini != 0 else 0
                     color = '#2ecc71' if profit >= 0 else '#e74c3c'
                     txt   = f"{mesa}  |  BANK: ${b_final:.2f}  |  P/L: {profit:+.2f}"
 
@@ -278,13 +279,12 @@ class LinupApp:
                 conn.close()
 
         if rows:
-            cum_efec  = (total_profit / total_ini * 100) if total_ini != 0 else 0
-            cum_color = '#2ecc71' if total_profit >= 0 else '#e74c3c'
+            cum_color = '#2ecc71' if total_efec >= 0 else '#e74c3c'
             rows.insert(0, ft.Container(
-                bgcolor='#1e2d1e' if total_profit >= 0 else '#2d1e1e',
+                bgcolor='#1e2d1e' if total_efec >= 0 else '#2d1e1e',
                 padding=10, margin=ft.margin.only(bottom=4),
                 content=ft.Text(
-                    f"EFICACIA TOTAL: {cum_efec:+.1f}%  |  P/L: {total_profit:+.2f}",
+                    f"EFICACIA TOTAL: {total_efec:+.1f}%  |  P/L: {total_profit:+.2f}",
                     color=cum_color, size=14, weight=ft.FontWeight.BOLD,
                     text_align=ft.TextAlign.CENTER,
                 ),
@@ -386,6 +386,75 @@ class LinupApp:
         except Exception:
             pass
         self.show_game_screen()
+
+    # ─────────────────────────────────────────────────────────────────
+    # STOP LOSS — se dispara al perder 33% del bank inicial
+    # ─────────────────────────────────────────────────────────────────
+    def _check_stop_loss(self):
+        if self.stop_loss_triggered:
+            return
+        if self.banca_inicial <= 0:
+            return
+        loss_pct = (self.banca_inicial - self.banca_actual) / self.banca_inicial
+        if loss_pct < 0.33:
+            return
+
+        self.stop_loss_triggered = True
+        self.activa = False
+
+        profit = round(self.banca_actual - self.banca_inicial, 2)
+        pl_pct = (profit / self.banca_inicial * 100) if self.banca_inicial != 0 else 0
+
+        ok, err_msg    = self._guardar_sesion()
+        guardado_txt   = "✅ Guardado en historial" if ok else f"❌ Error: {err_msg}"
+        guardado_color = '#2ecc71' if ok else '#e74c3c'
+
+        dlg = ft.AlertDialog(modal=True, bgcolor='#1e1e1e')
+
+        def cerrar(ev):
+            dlg.open = False
+            self.page.update()
+            self.show_main_menu()
+
+        dlg.title = ft.Text(
+            "⛔ STOP LOSS",
+            color='#e74c3c', size=18, weight=ft.FontWeight.BOLD,
+            text_align=ft.TextAlign.CENTER,
+        )
+        dlg.content = ft.Column(
+            tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Divider(color='#444444'),
+                ft.Text("Pérdida del 33% alcanzada.", color='#e74c3c',
+                        size=13, text_align=ft.TextAlign.CENTER),
+                ft.Container(height=6),
+                ft.Text(f"Bank inicial:  ${self.banca_inicial:.2f}",
+                        color=ft.Colors.WHITE, size=14),
+                ft.Text(f"Bank final:    ${self.banca_actual:.2f}",
+                        color=ft.Colors.WHITE, size=14),
+                ft.Container(height=8),
+                ft.Text(
+                    f"P/L:  ${profit:.2f}   ({pl_pct:.1f}%)",
+                    color='#e74c3c', size=20, weight=ft.FontWeight.BOLD,
+                ),
+                ft.Container(height=10),
+                ft.Text(guardado_txt, color=guardado_color, size=13),
+            ],
+        )
+        dlg.actions = [
+            ft.ElevatedButton(
+                content=ft.Text("CERRAR MESA", size=15, weight=ft.FontWeight.BOLD),
+                on_click=cerrar,
+                expand=True,
+                style=ft.ButtonStyle(bgcolor='#e74c3c', color=ft.Colors.WHITE),
+            )
+        ]
+        dlg.actions_alignment = ft.MainAxisAlignment.CENTER
+
+        self.page.overlay.append(dlg)
+        dlg.open = True
+        self.page.update()
 
     # ─────────────────────────────────────────────────────────────────
     # FINALIZAR — popup resumen → guarda → OK regresa al menú
@@ -727,7 +796,7 @@ class LinupApp:
 
     # Progresión para 2 grupos outside (columnas/docenas)
     # Total bet × val_fout: 0.6, 1.8, 2.7, 5.4, 8.1, 16.2 ...
-    PROG_2_OUT = [2, 6, 9, 18, 27, 54, 81]
+    PROG_2_OUT = [2, 6, 18, 54, 162, 486]
 
     def _is_outside(self):
         """True si todos los grupos activos son columnas o docenas."""
@@ -762,9 +831,9 @@ class LinupApp:
                 total      = self.val_fout * self.PROG_2_OUT[idx]
                 win_payout = (total / n) * 3
         else:
-            multi      = PROG_FIBO[self.idx_fibo_in] if n == 1 else (2 ** self.nivel_martingala_in)
+            multi      = PROG_FIBO[self.idx_fibo_in] if n == 1 else (3 ** self.nivel_martingala_in)
             total      = sum(self._group_cost(g) * multi for g in self.grupos_activos)
-            win_payout = (total / n) * 3
+            win_payout = self.val_fin * 36 * multi
 
         return total, win_payout
 
@@ -818,46 +887,114 @@ class LinupApp:
         except Exception:
             pass
 
-    def seleccionar_mixer(self, e):
-        g          = e.control.data['name']
-        base_color = e.control.data['color']
+    def _refresh_mixer_colors(self):
+        has_sel = bool(self.grupos_activos)
+        for g, btn in self.mixer_btns.items():
+            base_color = btn.data['color']
+            if g in self.grupos_activos:
+                btn.style = ft.ButtonStyle(
+                    bgcolor=base_color, color='#f1c40f',
+                    animation_duration=400,
+                    overlay_color={ft.ControlState.PRESSED: ft.Colors.with_opacity(0.4, ft.Colors.WHITE)},
+                )
+            elif has_sel:
+                btn.style = ft.ButtonStyle(
+                    bgcolor='#2a2a2a', color='#444444',
+                    animation_duration=400,
+                )
+            else:
+                btn.style = ft.ButtonStyle(
+                    bgcolor=base_color, color=ft.Colors.WHITE,
+                    animation_duration=400,
+                    overlay_color={ft.ControlState.PRESSED: ft.Colors.with_opacity(0.4, ft.Colors.WHITE)},
+                )
+            btn.update()
 
+    def seleccionar_mixer(self, e):
+        g = e.control.data['name']
         if g in self.grupos_activos:
             self.grupos_activos.remove(g)
-            e.control.style = ft.ButtonStyle(
-                bgcolor=base_color, color=ft.Colors.WHITE,
-                animation_duration=400,
-                overlay_color={ft.ControlState.PRESSED: ft.Colors.with_opacity(0.4, ft.Colors.WHITE)},
-            )
         elif len(self.grupos_activos) < 2:
             self.grupos_activos.append(g)
-            e.control.style = ft.ButtonStyle(
-                bgcolor=base_color, color='#f1c40f',
-                animation_duration=400,
-                overlay_color={ft.ControlState.PRESSED: ft.Colors.with_opacity(0.4, ft.Colors.WHITE)},
-            )
-        e.control.update()
+        self._refresh_mixer_colors()
         self.update_inv_label()
         self.lbl_inv.update()
 
-    def confirmar_manual(self, e=None):
-        if self.grupos_activos:
-            self.activa = True
-            self.btn_inv.style = ft.ButtonStyle(bgcolor='#3498db', color=ft.Colors.WHITE,
-                                                animation_duration=400)
-            self.btn_inv.update()
-            self.update_inv_label()
-            self.lbl_inv.update()
-
-    def auto_invertir_sug(self, grupos):
-        self.limpiar_seleccion_visual()
-        self.grupos_activos = list(grupos)
-        self.activa         = True
+    def _activate_bet(self):
+        self.activa = True
         self.btn_inv.style = ft.ButtonStyle(bgcolor='#3498db', color=ft.Colors.WHITE,
                                             animation_duration=400)
         self.btn_inv.update()
         self.update_inv_label()
         self.lbl_inv.update()
+
+    def _check_pre_bet_warning(self, on_confirm):
+        """Show warning if losing this bet would breach 33% stop loss. Calls on_confirm() if user proceeds."""
+        if self.stop_loss_triggered or self.banca_inicial <= 0:
+            on_confirm()
+            return
+        total_cost, _ = self._compute_bet()
+        potential_bank = self.banca_actual - total_cost
+        loss_pct = (self.banca_inicial - potential_bank) / self.banca_inicial
+        if loss_pct < 0.33:
+            on_confirm()
+            return
+
+        dlg = ft.AlertDialog(modal=True, bgcolor='#1e1e1e')
+
+        def continuar(ev):
+            dlg.open = False
+            self.page.update()
+            on_confirm()
+
+        def volver(ev):
+            dlg.open = False
+            self.page.update()
+
+        dlg.title = ft.Text(
+            "⚠️ ADVERTENCIA",
+            color='#f39c12', size=16, weight=ft.FontWeight.BOLD,
+            text_align=ft.TextAlign.CENTER,
+        )
+        dlg.content = ft.Column(
+            tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Divider(color='#444444'),
+                ft.Text("Si pierdes esta apuesta:", color=ft.Colors.WHITE, size=13),
+                ft.Container(height=4),
+                ft.Text(f"Bank: ${potential_bank:.2f}", color='#e74c3c',
+                        size=18, weight=ft.FontWeight.BOLD),
+                ft.Text(f"Pérdida: {loss_pct*100:.1f}%  (límite 33%)",
+                        color='#e74c3c', size=13),
+            ],
+        )
+        dlg.actions = [
+            ft.ElevatedButton(
+                content=ft.Text("VOLVER", size=14, weight=ft.FontWeight.BOLD),
+                on_click=volver, expand=1,
+                style=ft.ButtonStyle(bgcolor='#555555', color=ft.Colors.WHITE),
+            ),
+            ft.ElevatedButton(
+                content=ft.Text("CONTINUAR", size=14, weight=ft.FontWeight.BOLD),
+                on_click=continuar, expand=1,
+                style=ft.ButtonStyle(bgcolor='#e67e22', color=ft.Colors.WHITE),
+            ),
+        ]
+        dlg.actions_alignment = ft.MainAxisAlignment.CENTER
+        self.page.overlay.append(dlg)
+        dlg.open = True
+        self.page.update()
+
+    def confirmar_manual(self, e=None):
+        if self.grupos_activos:
+            self._check_pre_bet_warning(self._activate_bet)
+
+    def auto_invertir_sug(self, grupos):
+        self.limpiar_seleccion_visual()
+        self.grupos_activos = list(grupos)
+        self._refresh_mixer_colors()
+        self._check_pre_bet_warning(self._activate_bet)
 
     # ──────────────────────────────────────────────────────────────────
     # SUGERENCIAS
@@ -935,15 +1072,8 @@ class LinupApp:
             self.btn_inv.style = ft.ButtonStyle(bgcolor='#2ecc71', color=ft.Colors.WHITE,
                                                 animation_duration=400)
             self.btn_inv.update()
-        for b in self.mixer_btns.values():
-            base_color = b.data['color']
-            b.style = ft.ButtonStyle(
-                bgcolor=base_color, color=ft.Colors.WHITE,
-                animation_duration=400,
-                overlay_color={ft.ControlState.PRESSED: ft.Colors.with_opacity(0.4, ft.Colors.WHITE)},
-            )
-            b.update()
         self.grupos_activos = []
+        self._refresh_mixer_colors()
         self.update_inv_label()
         if self.lbl_inv:
             self.lbl_inv.update()
@@ -967,6 +1097,7 @@ class LinupApp:
         self.lbl_pl.color   = '#2ecc71' if pl >= 0 else '#e74c3c'
         self.update_inv_label()
         self.page.update()
+        self._check_stop_loss()
 
     def corregir_ultimo(self, e=None):
         if self.history_nums:
