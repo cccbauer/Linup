@@ -128,7 +128,7 @@ class LinupApp:
             return None
 
     def _guardar_sesion(self):
-        """Guarda sesion. Retorna (True, None) o (False, mensaje_error)."""
+        """Guarda o actualiza sesion. Retorna (True, None) o (False, mensaje_error)."""
         try:
             if not self.db_path:
                 init_err = getattr(self, "db_error", "desconocido")
@@ -137,14 +137,28 @@ class LinupApp:
             try:
                 profit = round(float(self.banca_actual - self.banca_inicial), 2)
                 fecha  = datetime.now().strftime("%d/%m %H:%M")
-                conn.execute(
-                    "INSERT INTO sesiones "
-                    "(mesa, fecha, profit, banca_inicial, banca_final) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (str(self.nombre_mesa), fecha, profit,
-                     round(float(self.banca_inicial), 2),
-                     round(float(self.banca_actual),  2))
-                )
+                
+                # Si hay session_id, actualizar la sesión existente
+                if self.session_id is not None:
+                    conn.execute(
+                        "UPDATE sesiones SET "
+                        "profit = ?, banca_final = ?, fecha = ? "
+                        "WHERE id = ?",
+                        (profit,
+                         round(float(self.banca_actual), 2),
+                         fecha,
+                         self.session_id)
+                    )
+                else:
+                    # Si no hay session_id, insertar nueva sesión
+                    conn.execute(
+                        "INSERT INTO sesiones "
+                        "(mesa, fecha, profit, banca_inicial, banca_final) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (str(self.nombre_mesa), fecha, profit,
+                         round(float(self.banca_inicial), 2),
+                         round(float(self.banca_actual),  2))
+                    )
                 conn.commit()
                 return True, None
             finally:
@@ -158,15 +172,19 @@ class LinupApp:
     def reset_variables(self):
         self.banca_inicial    = 100.0
         self.banca_actual     = 100.0
-        self.idx_fibo         = 0
-        self.nivel_martingala = 0
-        self.activa           = False
+        self.idx_fibo_out         = 0
+        self.nivel_martingala_out = 0
+        self.idx_fibo_in          = 0
+        self.nivel_martingala_in  = 0
+        self.last_bet_outside     = None
+        self.activa               = False
         self.grupos_activos   = []
         self.history_nums     = []
         self.sliding_window   = deque(maxlen=6)
         self.val_fin          = 0.10
         self.val_fout         = 0.30
         self.nombre_mesa      = "MESA 1"
+        self.session_id       = None
 
     # ──────────────────────────────────────────────────────────────────
     # NAVEGACION
@@ -213,6 +231,8 @@ class LinupApp:
     # ──────────────────────────────────────────────────────────────────
     def handle_show_history(self, e=None):
         rows = []
+        total_profit   = 0.0
+        total_ini      = 0.0
         conn = self._get_conn()
         if conn:
             try:
@@ -223,27 +243,31 @@ class LinupApp:
                 except Exception:
                     pass
                 cursor.execute(
-                    "SELECT mesa, profit, banca_inicial, banca_final "
+                    "SELECT id, mesa, profit, banca_inicial, banca_final "
                     "FROM sesiones ORDER BY id DESC LIMIT 20"
                 )
-                for mesa, profit, b_ini, b_final in cursor.fetchall():
+                for sid, mesa, profit, b_ini, b_final in cursor.fetchall():
                     b_final = b_final or 0.0
                     b_ini   = b_ini or b_final or 1.0
-                    efec    = (profit / b_ini * 100) if b_ini != 0 else 0
-                    color   = '#2ecc71' if profit >= 0 else '#e74c3c'
-                    txt     = f"{mesa}  |  BANK: ${b_final:.2f}  |  EFEC: {efec:+.1f}%"
+                    profit  = profit or 0.0
+                    total_profit += profit
+                    total_ini    += b_ini
+                    color = '#2ecc71' if profit >= 0 else '#e74c3c'
+                    txt   = f"{mesa}  |  BANK: ${b_final:.2f}  |  P/L: {profit:+.2f}"
 
-                    def make_loader(m, bi, bf):
+                    def make_loader(sid, m, bf):
                         def loader(ev):
+                            self.reset_variables()
+                            self.session_id    = sid
                             self.nombre_mesa   = str(m)
-                            self.banca_inicial = float(bi)
+                            self.banca_inicial = float(bf)
                             self.banca_actual  = float(bf)
                             self.render_setup_form(True)
                         return loader
 
                     rows.append(
                         ft.ElevatedButton(
-                            txt, on_click=make_loader(mesa, b_ini, b_final),
+                            txt, on_click=make_loader(sid, mesa, b_final),
                             width=340, height=60,
                             style=ft.ButtonStyle(bgcolor='#222222', color=color),
                         )
@@ -253,7 +277,19 @@ class LinupApp:
             finally:
                 conn.close()
 
-        if not rows:
+        if rows:
+            cum_efec  = (total_profit / total_ini * 100) if total_ini != 0 else 0
+            cum_color = '#2ecc71' if total_profit >= 0 else '#e74c3c'
+            rows.insert(0, ft.Container(
+                bgcolor='#1e2d1e' if total_profit >= 0 else '#2d1e1e',
+                padding=10, margin=ft.margin.only(bottom=4),
+                content=ft.Text(
+                    f"EFICACIA TOTAL: {cum_efec:+.1f}%  |  P/L: {total_profit:+.2f}",
+                    color=cum_color, size=14, weight=ft.FontWeight.BOLD,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+            ))
+        else:
             rows.append(ft.Text("Sin sesiones guardadas.", color='#7f8c8d'))
 
         self._set_view(
@@ -715,18 +751,18 @@ class LinupApp:
         if n == 0:
             return 0.0, 0.0
 
-        if self._is_outside():
+        is_out = self._is_outside()
+        if is_out:
             if n == 1:
-                multi      = PROG_FIBO[self.idx_fibo]
+                multi      = PROG_FIBO[self.idx_fibo_out]
                 total      = self.val_fout * multi
-                win_payout = total * 3          # 3× la ficha apostada
+                win_payout = total * 3
             else:
-                idx        = min(self.nivel_martingala, len(self.PROG_2_OUT) - 1)
+                idx        = min(self.nivel_martingala_out, len(self.PROG_2_OUT) - 1)
                 total      = self.val_fout * self.PROG_2_OUT[idx]
-                win_payout = (total / n) * 3    # 3× la ficha por grupo ganador
+                win_payout = (total / n) * 3
         else:
-            # Zonas / sectores: val_fin × len(grupo) por grupo
-            multi      = PROG_FIBO[self.idx_fibo] if n == 1 else (2 ** self.nivel_martingala)
+            multi      = PROG_FIBO[self.idx_fibo_in] if n == 1 else (2 ** self.nivel_martingala_in)
             total      = sum(self._group_cost(g) * multi for g in self.grupos_activos)
             win_payout = (total / n) * 3
 
@@ -739,20 +775,33 @@ class LinupApp:
 
             num = int(e.control.data)
             if self.activa:
-                n                  = len(self.grupos_activos)
-                total_cost, win_py = self._compute_bet()
-                self.banca_actual -= total_cost
+                n                    = len(self.grupos_activos)
+                is_out               = self._is_outside()
+                self.last_bet_outside = is_out
+                total_cost, win_py   = self._compute_bet()
+                self.banca_actual   -= total_cost
 
                 if any(num in GRUPOS_MAESTROS[g] for g in self.grupos_activos):
                     self.banca_actual += win_py
-                    self.idx_fibo         = 0
-                    self.nivel_martingala = 0
+                    if is_out:
+                        self.idx_fibo_out         = 0
+                        self.nivel_martingala_out = 0
+                    else:
+                        self.idx_fibo_in         = 0
+                        self.nivel_martingala_in = 0
                 else:
                     if n == 1:
-                        if self.idx_fibo < len(PROG_FIBO) - 1:
-                            self.idx_fibo += 1
+                        if is_out:
+                            if self.idx_fibo_out < len(PROG_FIBO) - 1:
+                                self.idx_fibo_out += 1
+                        else:
+                            if self.idx_fibo_in < len(PROG_FIBO) - 1:
+                                self.idx_fibo_in += 1
                     else:
-                        self.nivel_martingala += 1
+                        if is_out:
+                            self.nivel_martingala_out += 1
+                        else:
+                            self.nivel_martingala_in += 1
                 self.activa         = False
                 self.grupos_activos = []
                 self.limpiar_seleccion_visual()
@@ -922,10 +971,16 @@ class LinupApp:
     def corregir_ultimo(self, e=None):
         if self.history_nums:
             self.history_nums.pop()
-            if self.idx_fibo > 0:
-                self.idx_fibo -= 1
-            if self.nivel_martingala > 0:
-                self.nivel_martingala -= 1
+            if self.last_bet_outside is True:
+                if self.idx_fibo_out > 0:
+                    self.idx_fibo_out -= 1
+                if self.nivel_martingala_out > 0:
+                    self.nivel_martingala_out -= 1
+            elif self.last_bet_outside is False:
+                if self.idx_fibo_in > 0:
+                    self.idx_fibo_in -= 1
+                if self.nivel_martingala_in > 0:
+                    self.nivel_martingala_in -= 1
             self.update_ui()
             self.update_registration_table()
 
