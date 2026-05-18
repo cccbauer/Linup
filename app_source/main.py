@@ -2,10 +2,11 @@ import flet as ft
 from collections import deque
 import sqlite3
 import os
+import math
 from datetime import datetime
 import asyncio
 
-# --- CONFIGURACIÓN DE GRUPOS ---
+# --- GROUP CONFIGURATION ---
 ROJOS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 GRUPOS_MAESTROS = {
     '34': {1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34},
@@ -38,6 +39,8 @@ class LinupApp:
         self.reg_rows_box   = None
         self.reg_header_row = None
         self._on_game_screen = False
+        self.current_investment_id = None
+        self.lbl_inv_pl = None
 
         self.page.title      = "Linup v11.2"
         self.page.theme_mode = ft.ThemeMode.DARK
@@ -50,24 +53,27 @@ class LinupApp:
         self.page.add(self.root)
         self.page.update()
 
+        self.show_splash()
         self.init_db()
         self.reset_variables()
+        self.page.run_task(self._after_splash)
+
+    async def _after_splash(self):
+        await asyncio.sleep(2.0)
         self.show_main_menu()
 
     # ──────────────────────────────────────────────────────────────────
-    # FUENTE — tamaño fijo 15 para todos los botones
+    # TEXT HELPER
     # ──────────────────────────────────────────────────────────────────
     def _txt(self, label, size=15, bold=True):
-        """ft.Text para content= de ElevatedButton. Default size=15."""
         return ft.Text(
-            label,
-            size=size,
+            label, size=size,
             weight=ft.FontWeight.BOLD if bold else ft.FontWeight.NORMAL,
             text_align=ft.TextAlign.CENTER,
         )
 
     # ──────────────────────────────────────────────────────────────────
-    # ANCHO DE COLUMNA ADAPTABLE
+    # RESPONSIVE COLUMN WIDTH
     # ──────────────────────────────────────────────────────────────────
     def _col_width(self):
         w = self.page.width or 360
@@ -78,11 +84,10 @@ class LinupApp:
             self.update_registration_table()
 
     # ──────────────────────────────────────────────────────────────────
-    # BASE DE DATOS
+    # DATABASE
     # ──────────────────────────────────────────────────────────────────
     def init_db(self):
         self.db_error = None
-        # Candidate paths in priority order — Android needs app_support_path
         candidates = []
         asp = getattr(self.page, 'app_support_path', None)
         if asp:
@@ -104,20 +109,35 @@ class LinupApp:
                     " mesa TEXT, fecha TEXT, profit REAL, "
                     " banca_inicial REAL, banca_final REAL)"
                 )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS table_stats "
+                    "(mesa TEXT PRIMARY KEY, wins INTEGER DEFAULT 0, "
+                    " losses INTEGER DEFAULT 0, last_bank REAL DEFAULT 0)"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS investments "
+                    "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    " name TEXT, capital REAL, created_at TEXT)"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS investment_tables "
+                    "(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    " investment_id INTEGER, mesa_name TEXT, init_bank REAL)"
+                )
                 conn.commit()
                 try:
                     conn.execute("ALTER TABLE sesiones ADD COLUMN banca_inicial REAL")
                     conn.commit()
                 except Exception:
-                    pass  # columna ya existe
+                    pass  # column already exists
                 conn.close()
-                self.db_path = db_path  # éxito
+                self.db_path = db_path
                 break
             except Exception as ex:
                 self.db_error = str(ex)
                 continue
         if not self.db_path:
-            self.db_error = f"Todos los paths fallaron. Último: {self.db_error}"
+            self.db_error = f"All paths failed. Last: {self.db_error}"
 
     def _get_conn(self):
         if not self.db_path:
@@ -128,37 +148,29 @@ class LinupApp:
             return None
 
     def _guardar_sesion(self):
-        """Guarda o actualiza sesion. Retorna (True, None) o (False, mensaje_error)."""
+        """Save or update session. Returns (True, None) or (False, error_msg)."""
         try:
             if not self.db_path:
-                init_err = getattr(self, "db_error", "desconocido")
-                raise Exception(f"BD no disponible. init_db error: {init_err}")
+                init_err = getattr(self, "db_error", "unknown")
+                raise Exception(f"DB unavailable. Error: {init_err}")
             conn = sqlite3.connect(self.db_path)
             try:
                 profit = round(float(self.banca_actual - self.banca_inicial), 2)
                 fecha  = datetime.now().strftime("%d/%m %H:%M")
-                
-                # Si hay session_id, actualizar la sesión existente
                 if self.session_id is not None:
                     conn.execute(
-                        "UPDATE sesiones SET "
-                        "profit = ?, banca_final = ?, fecha = ? "
-                        "WHERE id = ?",
-                        (profit,
-                         round(float(self.banca_actual), 2),
-                         fecha,
-                         self.session_id)
+                        "UPDATE sesiones SET profit=?, banca_final=?, fecha=? WHERE id=?",
+                        (profit, round(float(self.banca_actual), 2), fecha, self.session_id)
                     )
                 else:
-                    # Si no hay session_id, insertar nueva sesión
-                    conn.execute(
-                        "INSERT INTO sesiones "
-                        "(mesa, fecha, profit, banca_inicial, banca_final) "
+                    cursor = conn.execute(
+                        "INSERT INTO sesiones (mesa, fecha, profit, banca_inicial, banca_final) "
                         "VALUES (?, ?, ?, ?, ?)",
                         (str(self.nombre_mesa), fecha, profit,
                          round(float(self.banca_inicial), 2),
-                         round(float(self.banca_actual),  2))
+                         round(float(self.banca_actual), 2))
                     )
+                    self.session_id = cursor.lastrowid
                 conn.commit()
                 return True, None
             finally:
@@ -166,12 +178,34 @@ class LinupApp:
         except Exception as ex:
             return False, str(ex)
 
+    def _update_table_stats(self, is_win: bool):
+        """Increment win or loss counter and update last_bank for this table."""
+        conn = self._get_conn()
+        if not conn:
+            return
+        try:
+            w  = 1 if is_win else 0
+            l  = 0 if is_win else 1
+            bk = round(float(self.banca_actual), 2)
+            conn.execute(
+                "INSERT INTO table_stats (mesa, wins, losses, last_bank) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(mesa) DO UPDATE SET "
+                "wins=wins+?, losses=losses+?, last_bank=?",
+                (self.nombre_mesa, w, l, bk, w, l, bk)
+            )
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
     # ──────────────────────────────────────────────────────────────────
-    # ESTADO
+    # STATE
     # ──────────────────────────────────────────────────────────────────
     def reset_variables(self):
-        self.banca_inicial    = 100.0
-        self.banca_actual     = 100.0
+        self.banca_inicial        = 100.0
+        self.banca_actual         = 100.0
         self.idx_fibo_out         = 0
         self.nivel_martingala_out = 0
         self.idx_fibo_in          = 0
@@ -179,26 +213,62 @@ class LinupApp:
         self.last_bet_outside     = None
         self.stop_loss_triggered  = False
         self.activa               = False
-        self.grupos_activos   = []
-        self.history_nums     = []
-        self.sliding_window   = deque(maxlen=6)
-        self.val_fin          = 0.10
-        self.val_fout         = 0.30
-        self.nombre_mesa      = "MESA 1"
-        self.session_id       = None
+        self.grupos_activos       = []
+        self.history_nums         = []
+        self.sliding_window       = deque(maxlen=6)
+        self.val_fin              = 0.10
+        self.val_fout             = 0.30
+        self.nombre_mesa          = "TABLE 1"
+        self.session_id           = None
+        self.inv_name             = ""
+        self.inv_capital          = 0.0
+        self.inv_other_pl         = 0.0
 
     # ──────────────────────────────────────────────────────────────────
-    # NAVEGACION
+    # NAVIGATION
     # ──────────────────────────────────────────────────────────────────
     def _set_view(self, content: ft.Control):
         self.root.content = content
         self.page.update()
 
+    def _go_home(self, e=None):
+        """Return to investment dashboard if inside one, otherwise main menu."""
+        if self.current_investment_id is not None:
+            inv_id = self.current_investment_id
+            self.show_investment_dashboard(inv_id)
+        else:
+            self.show_main_menu()
+
     # ──────────────────────────────────────────────────────────────────
-    # MENU PRINCIPAL
+    # SPLASH SCREEN
+    # ──────────────────────────────────────────────────────────────────
+    def show_splash(self):
+        self._set_view(
+            ft.Container(
+                bgcolor='#1a1a1a', expand=True,
+                content=ft.Column(
+                    expand=True,
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Text("Linup", color='#3498db', size=64,
+                                weight=ft.FontWeight.BOLD),
+                        ft.Container(height=8),
+                        ft.Text("v11.2", color='#7f8c8d', size=18),
+                        ft.Container(height=48),
+                        ft.ProgressRing(color='#3498db', width=36, height=36,
+                                        stroke_width=3),
+                    ],
+                ),
+            )
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # MAIN MENU
     # ──────────────────────────────────────────────────────────────────
     def show_main_menu(self, e=None):
         self._on_game_screen = False
+        self.current_investment_id = None
         self._set_view(
             ft.Container(
                 bgcolor='#1a1a1a', expand=True, padding=20,
@@ -207,17 +277,20 @@ class LinupApp:
                     alignment=ft.MainAxisAlignment.CENTER,
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     controls=[
-                        ft.Text("Linup", color='#3498db', size=32,
+                        ft.Text("Linup", color='#3498db', size=42,
                                 weight=ft.FontWeight.BOLD),
-                        ft.Container(height=20),
+                        ft.Container(height=40),
                         ft.ElevatedButton(
-                            "NUEVA SESION", on_click=self.handle_new_session,
+                            "NEW INVESTMENT",
+                            on_click=self.show_new_investment_form,
                             width=280, height=60,
                             style=ft.ButtonStyle(bgcolor='#27ae60',
                                                  color=ft.Colors.WHITE),
                         ),
+                        ft.Container(height=12),
                         ft.ElevatedButton(
-                            "HISTORIAL / CARGAR", on_click=self.handle_show_history,
+                            "LOAD INVESTMENT",
+                            on_click=self.show_load_investments,
                             width=280, height=60,
                             style=ft.ButtonStyle(bgcolor='#2980b9',
                                                  color=ft.Colors.WHITE),
@@ -228,47 +301,347 @@ class LinupApp:
         )
 
     # ──────────────────────────────────────────────────────────────────
-    # HISTORIAL
+    # NEW INVESTMENT — Step 1: name / capital / number of tables
     # ──────────────────────────────────────────────────────────────────
-    def handle_show_history(self, e=None):
+    def show_new_investment_form(self, e=None):
+        inv_name_field = ft.TextField(
+            label="Investment Name", value="",
+            bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=50,
+        )
+        capital_field = ft.TextField(
+            label="Capital ($)", value="",
+            bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=50,
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+        num_tables_field = ft.TextField(
+            label="Number of Tables", value="1",
+            bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=50,
+            keyboard_type=ft.KeyboardType.NUMBER,
+        )
+
+        def on_next(ev):
+            try:
+                inv_name   = inv_name_field.value.strip().upper() or "INVESTMENT 1"
+                capital    = float(capital_field.value or 0)
+                num_tables = max(1, min(10, int(num_tables_field.value or 1)))
+            except Exception:
+                return
+            self._show_table_setup(inv_name, capital, num_tables)
+
+        self._set_view(
+            ft.Container(
+                bgcolor='#1a1a1a', expand=True, padding=20,
+                content=ft.ListView(
+                    expand=True,
+                    controls=[
+                        ft.ElevatedButton(
+                            "CANCEL", on_click=self.show_main_menu,
+                            style=ft.ButtonStyle(bgcolor='#c0392b',
+                                                 color=ft.Colors.WHITE),
+                        ),
+                        ft.Container(height=16),
+                        ft.Text("NEW INVESTMENT", color='#3498db', size=20,
+                                weight=ft.FontWeight.BOLD),
+                        ft.Container(height=12),
+                        inv_name_field,
+                        ft.Container(height=8),
+                        capital_field,
+                        ft.Container(height=8),
+                        num_tables_field,
+                        ft.Container(height=20),
+                        ft.ElevatedButton(
+                            "NEXT  →", on_click=on_next,
+                            height=60, expand=True,
+                            style=ft.ButtonStyle(bgcolor='#2980b9',
+                                                 color=ft.Colors.WHITE),
+                        ),
+                    ],
+                ),
+            )
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # NEW INVESTMENT — Step 2: table names and banks
+    # ──────────────────────────────────────────────────────────────────
+    def _show_table_setup(self, inv_name: str, capital: float, num_tables: int):
+        bank_per_table = round(capital * 0.05, 2)
+        name_fields = []
+        bank_fields = []
         rows = []
-        total_profit   = 0.0
-        total_efec     = 0.0
+        for i in range(num_tables):
+            nf = ft.TextField(
+                value=f"TABLE {i + 1}",
+                bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=45,
+                expand=2,
+            )
+            bf = ft.TextField(
+                value=str(bank_per_table),
+                bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=45,
+                keyboard_type=ft.KeyboardType.NUMBER,
+                expand=1,
+            )
+            name_fields.append(nf)
+            bank_fields.append(bf)
+            rows.append(ft.Row(controls=[nf, bf], spacing=6))
+
+        def on_create(ev):
+            tables_data = []
+            for nf, bf in zip(name_fields, bank_fields):
+                t_name = nf.value.strip().upper() or f"TABLE {len(tables_data) + 1}"
+                try:
+                    t_bank = float(bf.value or bank_per_table)
+                except Exception:
+                    t_bank = bank_per_table
+                tables_data.append((t_name, t_bank))
+            self._create_investment(inv_name, capital, tables_data)
+
+        controls = [
+            ft.ElevatedButton(
+                "←  BACK", on_click=self.show_new_investment_form,
+                style=ft.ButtonStyle(bgcolor='#c0392b', color=ft.Colors.WHITE),
+            ),
+            ft.Container(height=12),
+            ft.Text(f"{inv_name}  |  Capital: ${capital:.2f}", color='#3498db',
+                    size=16, weight=ft.FontWeight.BOLD),
+            ft.Container(height=4),
+            ft.Row(controls=[
+                ft.Text("TABLE NAME", color='#7f8c8d', size=12, expand=2),
+                ft.Text("BANK", color='#7f8c8d', size=12, expand=1),
+            ]),
+            ft.Container(height=4),
+        ] + rows + [
+            ft.Container(height=20),
+            ft.ElevatedButton(
+                "CREATE INVESTMENT", on_click=on_create,
+                height=60, expand=True,
+                style=ft.ButtonStyle(bgcolor='#27ae60', color=ft.Colors.WHITE),
+            ),
+        ]
+
+        self._set_view(
+            ft.Container(
+                bgcolor='#1a1a1a', expand=True, padding=20,
+                content=ft.ListView(expand=True, controls=controls),
+            )
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # SAVE INVESTMENT TO DB
+    # ──────────────────────────────────────────────────────────────────
+    def _create_investment(self, inv_name: str, capital: float, tables_data: list):
+        conn = self._get_conn()
+        inv_id = None
+        if conn:
+            try:
+                fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
+                cursor = conn.execute(
+                    "INSERT INTO investments (name, capital, created_at) VALUES (?, ?, ?)",
+                    (inv_name, round(capital, 2), fecha)
+                )
+                inv_id = cursor.lastrowid
+                for mesa_name, init_bank in tables_data:
+                    conn.execute(
+                        "INSERT INTO investment_tables "
+                        "(investment_id, mesa_name, init_bank) VALUES (?, ?, ?)",
+                        (inv_id, mesa_name, round(init_bank, 2))
+                    )
+                conn.commit()
+            except Exception:
+                pass
+            finally:
+                conn.close()
+        if inv_id:
+            self.show_investment_dashboard(inv_id)
+        else:
+            self.show_main_menu()
+
+    # ──────────────────────────────────────────────────────────────────
+    # INVESTMENT DASHBOARD
+    # ──────────────────────────────────────────────────────────────────
+    def show_investment_dashboard(self, investment_id):
+        self._on_game_screen = False
+        self.current_investment_id = investment_id
+        inv_name    = "Investment"
+        inv_capital = 0.0
+        table_rows  = []
         conn = self._get_conn()
         if conn:
             try:
                 cursor = conn.cursor()
-                try:
-                    cursor.execute("ALTER TABLE sesiones ADD COLUMN banca_inicial REAL")
-                    conn.commit()
-                except Exception:
-                    pass
                 cursor.execute(
-                    "SELECT id, mesa, profit, banca_inicial, banca_final "
-                    "FROM sesiones ORDER BY id DESC LIMIT 20"
+                    "SELECT name, capital FROM investments WHERE id=?",
+                    (investment_id,)
                 )
-                for sid, mesa, profit, b_ini, b_final in cursor.fetchall():
-                    b_final = b_final or 0.0
-                    b_ini   = b_ini or b_final or 1.0
-                    profit  = profit or 0.0
-                    total_profit += profit
-                    total_efec   += (profit / b_ini * 100) if b_ini != 0 else 0
-                    color = '#2ecc71' if profit >= 0 else '#e74c3c'
-                    txt   = f"{mesa}  |  BANK: ${b_final:.2f}  |  P/L: {profit:+.2f}"
+                row = cursor.fetchone()
+                if row:
+                    inv_name, inv_capital = row
 
-                    def make_loader(sid, m, bf):
+                cursor.execute(
+                    "SELECT mesa_name, init_bank FROM investment_tables "
+                    "WHERE investment_id=? ORDER BY id",
+                    (investment_id,)
+                )
+                inv_tables = cursor.fetchall()
+
+                # Collect all table data first so we can compute per-table other_pl
+                all_tdata = []  # (mesa_name, init_bank, wins, losses, last_bank)
+                for mesa_name, init_bank in inv_tables:
+                    cursor.execute(
+                        "SELECT wins, losses, last_bank FROM table_stats WHERE mesa=?",
+                        (mesa_name,)
+                    )
+                    stats = cursor.fetchone()
+                    if stats and (stats[0] or stats[1]):
+                        w = stats[0] or 0
+                        l = stats[1] or 0
+                        bk = stats[2] or float(init_bank)
+                    else:
+                        w, l, bk = 0, 0, float(init_bank)
+                    all_tdata.append((mesa_name, float(init_bank), w, l, bk))
+
+                total_wins   = sum(d[2] for d in all_tdata)
+                total_losses = sum(d[3] for d in all_tdata)
+
+                for i, (mesa_name, init_bank, wins, losses, last_bank) in enumerate(all_tdata):
+                    # P/L from all OTHER tables (used in game screen bar)
+                    other_pl = sum((d[4] - d[1]) for j, d in enumerate(all_tdata) if j != i)
+
+                    total = wins + losses
+                    eff   = (wins / total * 100) if total > 0 else 0.0
+                    color = '#2ecc71' if (total == 0 or eff >= 50) else '#e74c3c'
+                    if total == 0:
+                        txt = f"{mesa_name}  |  ${last_bank:.2f}  |  New"
+                    else:
+                        txt = (f"{mesa_name}  |  ${last_bank:.2f}"
+                               f"  |  W:{wins} L:{losses}  |  {eff:.0f}%")
+
+                    def make_loader(m, bk, has_hist, opl):
                         def loader(ev):
                             self.reset_variables()
-                            self.session_id    = sid
+                            self.current_investment_id = investment_id
+                            self.inv_name      = inv_name
+                            self.inv_capital   = float(inv_capital)
+                            self.inv_other_pl  = opl
                             self.nombre_mesa   = str(m)
-                            self.banca_inicial = float(bf)
-                            self.banca_actual  = float(bf)
-                            self.render_setup_form(True)
+                            self.banca_inicial = float(bk)
+                            self.banca_actual  = float(bk)
+                            self.render_setup_form(has_hist)
+                        return loader
+
+                    table_rows.append(
+                        ft.ElevatedButton(
+                            txt,
+                            on_click=make_loader(mesa_name, last_bank, total > 0, other_pl),
+                            width=340, height=60,
+                            style=ft.ButtonStyle(bgcolor='#222222', color=color),
+                        )
+                    )
+
+                total_pl   = sum(d[4] - d[1] for d in all_tdata)
+                total_bank = sum(d[4] for d in all_tdata)
+                if table_rows:
+                    t  = total_wins + total_losses
+                    te = (total_wins / t * 100) if t > 0 else 0.0
+                    tc = '#2ecc71' if total_pl >= 0 else '#e74c3c'
+                    pl_sign  = "+" if total_pl >= 0 else ""
+                    pl_pct   = (total_pl / float(inv_capital) * 100) if inv_capital else 0.0
+                    eff_txt  = f"EFF: {te:.0f}%  W:{total_wins} L:{total_losses}\n" if t > 0 else ""
+                    table_rows.insert(0, ft.Container(
+                        bgcolor='#1e2d1e' if total_pl >= 0 else '#2d1e1e',
+                        padding=10, margin=ft.margin.only(bottom=4),
+                        content=ft.Text(
+                            f"{eff_txt}${total_bank:.2f}  |  P/L: {pl_sign}${total_pl:.2f} ({pl_sign}{pl_pct:.1f}%)",
+                            color=tc, size=13, weight=ft.FontWeight.BOLD,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                    ))
+            except Exception as ex:
+                table_rows.append(ft.Text(f"Error: {ex}", color='#e74c3c'))
+            finally:
+                conn.close()
+
+        if not table_rows:
+            table_rows.append(ft.Text("No tables found.", color='#7f8c8d'))
+
+        self._set_view(
+            ft.Container(
+                bgcolor='#1a1a1a', expand=True,
+                content=ft.Column(
+                    expand=True,
+                    controls=[
+                        ft.Container(
+                            bgcolor='#2c3e50',
+                            padding=ft.padding.only(left=8, right=8, top=36, bottom=8),
+                            content=ft.Row(
+                                controls=[
+                                    ft.ElevatedButton(
+                                        "MENU",
+                                        on_click=self.show_main_menu,
+                                        style=ft.ButtonStyle(bgcolor='#34495e',
+                                                             color=ft.Colors.WHITE),
+                                    ),
+                                    ft.Text(
+                                        f"{inv_name}  |  ${inv_capital:.2f}",
+                                        color=ft.Colors.WHITE, size=13,
+                                        weight=ft.FontWeight.BOLD, expand=True,
+                                        text_align=ft.TextAlign.RIGHT,
+                                    ),
+                                ],
+                            ),
+                        ),
+                        ft.ListView(controls=table_rows, expand=True,
+                                    spacing=4, padding=10),
+                    ],
+                ),
+            )
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # LOAD INVESTMENT
+    # ──────────────────────────────────────────────────────────────────
+    def show_load_investments(self, e=None):
+        rows = []
+        conn = self._get_conn()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, name, capital FROM investments ORDER BY id DESC"
+                )
+                for inv_id, name, capital in cursor.fetchall():
+                    cursor2 = conn.cursor()
+                    cursor2.execute(
+                        "SELECT mesa_name FROM investment_tables WHERE investment_id=?",
+                        (inv_id,)
+                    )
+                    mesa_names = [r[0] for r in cursor2.fetchall()]
+                    wins = losses = 0
+                    for mn in mesa_names:
+                        cursor2.execute(
+                            "SELECT wins, losses FROM table_stats WHERE mesa=?", (mn,)
+                        )
+                        s = cursor2.fetchone()
+                        if s:
+                            wins   += s[0] or 0
+                            losses += s[1] or 0
+                    total    = wins + losses
+                    eff      = (wins / total * 100) if total > 0 else 0.0
+                    color    = '#2ecc71' if (total == 0 or eff >= 50) else '#e74c3c'
+                    n_tables = len(mesa_names)
+                    if total > 0:
+                        txt = (f"{name}  |  ${capital:.2f}"
+                               f"  |  {n_tables} tables  |  EFF:{eff:.0f}%")
+                    else:
+                        txt = f"{name}  |  ${capital:.2f}  |  {n_tables} tables"
+
+                    def make_loader(iid):
+                        def loader(ev):
+                            self.show_investment_dashboard(iid)
                         return loader
 
                     rows.append(
                         ft.ElevatedButton(
-                            txt, on_click=make_loader(sid, mesa, b_final),
+                            txt, on_click=make_loader(inv_id),
                             width=340, height=60,
                             style=ft.ButtonStyle(bgcolor='#222222', color=color),
                         )
@@ -278,19 +651,8 @@ class LinupApp:
             finally:
                 conn.close()
 
-        if rows:
-            cum_color = '#2ecc71' if total_efec >= 0 else '#e74c3c'
-            rows.insert(0, ft.Container(
-                bgcolor='#1e2d1e' if total_efec >= 0 else '#2d1e1e',
-                padding=10, margin=ft.margin.only(bottom=4),
-                content=ft.Text(
-                    f"EFICACIA TOTAL: {total_efec:+.1f}%  |  P/L: {total_profit:+.2f}",
-                    color=cum_color, size=14, weight=ft.FontWeight.BOLD,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-            ))
-        else:
-            rows.append(ft.Text("Sin sesiones guardadas.", color='#7f8c8d'))
+        if not rows:
+            rows.append(ft.Text("No investments saved.", color='#7f8c8d'))
 
         self._set_view(
             ft.Container(
@@ -299,48 +661,59 @@ class LinupApp:
                     expand=True,
                     controls=[
                         ft.Container(
-                            bgcolor='#2c3e50', padding=8,
+                            bgcolor='#2c3e50',
+                            padding=ft.padding.only(left=8, right=8, top=36, bottom=8),
                             content=ft.ElevatedButton(
-                                "VOLVER", on_click=self.show_main_menu,
+                                "BACK", on_click=self.show_main_menu,
                                 style=ft.ButtonStyle(bgcolor='#34495e',
                                                      color=ft.Colors.WHITE),
                             ),
                         ),
-                        ft.ListView(controls=rows, expand=True,
-                                    spacing=4, padding=10),
+                        ft.ListView(controls=rows, expand=True, spacing=4, padding=10),
                     ],
                 ),
             )
         )
 
     # ──────────────────────────────────────────────────────────────────
-    # FORMULARIO DE CONFIGURACION
+    # SESSION SETUP FORM
     # ──────────────────────────────────────────────────────────────────
-    def handle_new_session(self, e=None):
-        self.reset_variables()
-        self.render_setup_form(False)
-
     def render_setup_form(self, is_continue: bool):
         self.table_input = ft.TextField(
             value=str(self.nombre_mesa),
             bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=45,
+            read_only=True,
         )
-        self.banca_input = ft.TextField(
-            value=str(self.banca_actual),
-            bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=45,
-            keyboard_type=ft.KeyboardType.NUMBER,
-        )
+        sug_fin  = round(self.banca_actual * 0.0005, 2)
+        sug_fout = round(self.banca_actual * 0.0015, 2)
         self.fin_input = ft.TextField(
-            value=str(self.val_fin),
+            value=str(sug_fin),
             bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=45,
             keyboard_type=ft.KeyboardType.NUMBER,
         )
         self.fout_input = ft.TextField(
-            value=str(self.val_fout),
+            value=str(sug_fout),
             bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=45,
             keyboard_type=ft.KeyboardType.NUMBER,
         )
-        btn_txt = "REANUDAR MESA" if is_continue else "ABRIR MESA"
+
+        def _on_bank_change(e):
+            try:
+                bk = float(self.banca_input.value or 0)
+                self.fin_input.value  = str(round(bk * 0.0005, 2))
+                self.fout_input.value = str(round(bk * 0.0015, 2))
+                self.fin_input.update()
+                self.fout_input.update()
+            except Exception:
+                pass
+
+        self.banca_input = ft.TextField(
+            value=str(self.banca_actual),
+            bgcolor=ft.Colors.WHITE, color=ft.Colors.BLACK, height=45,
+            keyboard_type=ft.KeyboardType.NUMBER,
+            on_change=_on_bank_change,
+        )
+        btn_txt = "RESUME TABLE" if is_continue else "OPEN TABLE"
         self._set_view(
             ft.Container(
                 bgcolor='#1a1a1a', expand=True, padding=20,
@@ -348,18 +721,18 @@ class LinupApp:
                     expand=True,
                     controls=[
                         ft.ElevatedButton(
-                            "CANCELAR", on_click=self.show_main_menu,
+                            "CANCEL", on_click=self._go_home,
                             style=ft.ButtonStyle(bgcolor='#c0392b',
                                                  color=ft.Colors.WHITE),
                         ),
                         ft.Container(height=10),
-                        ft.Text("NOMBRE MESA:", color=ft.Colors.WHITE),
+                        ft.Text("TABLE:", color=ft.Colors.WHITE),
                         self.table_input,
                         ft.Text("BANK:", color=ft.Colors.WHITE),
                         self.banca_input,
-                        ft.Text("FICHA IN:", color=ft.Colors.WHITE),
+                        ft.Text("CHIP IN (0.05% bank):", color=ft.Colors.WHITE),
                         self.fin_input,
-                        ft.Text("FICHA OUT (BASE):", color=ft.Colors.WHITE),
+                        ft.Text("CHIP OUT BASE (0.15% bank):", color=ft.Colors.WHITE),
                         self.fout_input,
                         ft.Container(height=10),
                         ft.ElevatedButton(
@@ -374,21 +747,21 @@ class LinupApp:
         )
 
     # ──────────────────────────────────────────────────────────────────
-    # INICIAR CICLO
+    # START SESSION
     # ──────────────────────────────────────────────────────────────────
     def iniciar_ciclo(self, e=None):
         try:
-            self.nombre_mesa   = str(self.table_input.value).upper() or "MESA 1"
+            self.nombre_mesa   = str(self.table_input.value).upper() or "TABLE 1"
             self.banca_inicial = float(self.banca_input.value or 100)
             self.banca_actual  = self.banca_inicial
-            self.val_fin       = float(self.fin_input.value  or 0.1)
-            self.val_fout      = float(self.fout_input.value or 0.3)
+            self.val_fin       = float(self.fin_input.value)  if self.fin_input.value  else round(self.banca_inicial * 0.0005, 2)
+            self.val_fout      = float(self.fout_input.value) if self.fout_input.value else round(self.banca_inicial * 0.0015, 2)
         except Exception:
             pass
         self.show_game_screen()
 
     # ─────────────────────────────────────────────────────────────────
-    # STOP LOSS — se dispara al perder 33% del bank inicial
+    # STOP LOSS — triggers at 33% loss of initial bank
     # ─────────────────────────────────────────────────────────────────
     def _check_stop_loss(self):
         if self.stop_loss_triggered:
@@ -406,7 +779,8 @@ class LinupApp:
         pl_pct = (profit / self.banca_inicial * 100) if self.banca_inicial != 0 else 0
 
         ok, err_msg    = self._guardar_sesion()
-        guardado_txt   = "✅ Guardado en historial" if ok else f"❌ Error: {err_msg}"
+        self._update_table_stats(False)
+        guardado_txt   = "Saved to history" if ok else f"Error: {err_msg}"
         guardado_color = '#2ecc71' if ok else '#e74c3c'
 
         dlg = ft.AlertDialog(modal=True, bgcolor='#1e1e1e')
@@ -414,10 +788,10 @@ class LinupApp:
         def cerrar(ev):
             dlg.open = False
             self.page.update()
-            self.show_main_menu()
+            self._go_home()
 
         dlg.title = ft.Text(
-            "⛔ STOP LOSS",
+            "STOP LOSS",
             color='#e74c3c', size=18, weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
         )
@@ -426,12 +800,12 @@ class LinupApp:
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
                 ft.Divider(color='#444444'),
-                ft.Text("Pérdida del 33% alcanzada.", color='#e74c3c',
+                ft.Text("33% loss limit reached.", color='#e74c3c',
                         size=13, text_align=ft.TextAlign.CENTER),
                 ft.Container(height=6),
-                ft.Text(f"Bank inicial:  ${self.banca_inicial:.2f}",
+                ft.Text(f"Initial bank:  ${self.banca_inicial:.2f}",
                         color=ft.Colors.WHITE, size=14),
-                ft.Text(f"Bank final:    ${self.banca_actual:.2f}",
+                ft.Text(f"Final bank:    ${self.banca_actual:.2f}",
                         color=ft.Colors.WHITE, size=14),
                 ft.Container(height=8),
                 ft.Text(
@@ -444,7 +818,7 @@ class LinupApp:
         )
         dlg.actions = [
             ft.ElevatedButton(
-                content=ft.Text("CERRAR MESA", size=15, weight=ft.FontWeight.BOLD),
+                content=ft.Text("CLOSE TABLE", size=15, weight=ft.FontWeight.BOLD),
                 on_click=cerrar,
                 expand=True,
                 style=ft.ButtonStyle(bgcolor='#e74c3c', color=ft.Colors.WHITE),
@@ -457,7 +831,7 @@ class LinupApp:
         self.page.update()
 
     # ─────────────────────────────────────────────────────────────────
-    # FINALIZAR — popup resumen → guarda → OK regresa al menú
+    # FINALIZE SESSION
     # ─────────────────────────────────────────────────────────────────
     def finalizar_sesion(self, e=None):
         profit   = round(self.banca_actual - self.banca_inicial, 2)
@@ -466,9 +840,9 @@ class LinupApp:
         color    = '#2ecc71' if positivo else '#e74c3c'
         signo    = "+" if positivo else ""
 
-        # Guardar en BD
         ok, err_msg    = self._guardar_sesion()
-        guardado_txt   = "✅ Guardado en historial" if ok else f"❌ Error: {err_msg}"
+        self._update_table_stats(profit >= 0)
+        guardado_txt   = "Saved to history" if ok else f"Error: {err_msg}"
         guardado_color = '#2ecc71' if ok else '#e74c3c'
 
         dlg = ft.AlertDialog(modal=True, bgcolor='#1e1e1e')
@@ -476,10 +850,10 @@ class LinupApp:
         def cerrar(ev):
             dlg.open = False
             self.page.update()
-            self.show_main_menu()
+            self._go_home()
 
         dlg.title = ft.Text(
-            f"RESUMEN  {self.nombre_mesa}",
+            f"SUMMARY  {self.nombre_mesa}",
             color='#3498db', size=16, weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
         )
@@ -488,9 +862,9 @@ class LinupApp:
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
                 ft.Divider(color='#444444'),
-                ft.Text(f"Bank inicial:  ${self.banca_inicial:.2f}",
+                ft.Text(f"Initial bank:  ${self.banca_inicial:.2f}",
                         color=ft.Colors.WHITE, size=14),
-                ft.Text(f"Bank final:    ${self.banca_actual:.2f}",
+                ft.Text(f"Final bank:    ${self.banca_actual:.2f}",
                         color=ft.Colors.WHITE, size=14),
                 ft.Container(height=8),
                 ft.Text(
@@ -516,12 +890,36 @@ class LinupApp:
         self.page.update()
 
     # ──────────────────────────────────────────────────────────────────
-    # PANTALLA DE JUEGO
+    # GAME SCREEN
     # ──────────────────────────────────────────────────────────────────
     def show_game_screen(self):
         self._on_game_screen = True
 
-        # ── Barra de mesa ──────────────────────────────────────────
+        # ── Investment bar (shown only when inside an investment) ───
+        inv_bar_controls = []
+        if self.current_investment_id and self.inv_name:
+            init_pl = self.inv_other_pl + (self.banca_actual - self.banca_inicial)
+            self.lbl_inv_pl = ft.Text(
+                f"P/L: {init_pl:+.2f}",
+                color='#2ecc71' if init_pl >= 0 else '#e74c3c',
+                weight=ft.FontWeight.BOLD, size=9,
+                text_align=ft.TextAlign.RIGHT,
+            )
+            inv_bar_controls = [ft.Container(
+                bgcolor='#0a0a0a',
+                padding=ft.padding.symmetric(horizontal=8, vertical=3),
+                content=ft.Row(controls=[
+                    ft.Text(
+                        f"{self.inv_name}  |  Start: ${self.inv_capital:.2f}",
+                        color='#7f8c8d', size=9, weight=ft.FontWeight.BOLD,
+                        expand=True,
+                    ),
+                    self.lbl_inv_pl,
+                ]),
+            )]
+        else:
+            self.lbl_inv_pl = None
+
         mesa_bar = ft.Container(
             bgcolor='#000000',
             padding=ft.padding.symmetric(horizontal=8, vertical=4),
@@ -529,13 +927,12 @@ class LinupApp:
                             weight=ft.FontWeight.BOLD, size=11),
         )
 
-        # ── Stats bar ──────────────────────────────────────────────
         self.lbl_bank = ft.Text(
             f"BANK: ${self.banca_actual:.2f}",
             color='#2ecc71', weight=ft.FontWeight.BOLD, size=10, expand=True,
         )
         self.lbl_inv = ft.Text(
-            "INV: $0.00",
+            "BET: $0.00",
             color='#f1c40f', weight=ft.FontWeight.BOLD, size=10, expand=True,
             text_align=ft.TextAlign.CENTER,
         )
@@ -549,7 +946,6 @@ class LinupApp:
             content=ft.Row(controls=[self.lbl_bank, self.lbl_inv, self.lbl_pl]),
         )
 
-        # ── Sugerencias ────────────────────────────────────────────
         self.sug_row = ft.Row(
             controls=[
                 ft.ElevatedButton(
@@ -566,7 +962,6 @@ class LinupApp:
             content=self.sug_row,
         )
 
-        # ── Mixer ──────────────────────────────────────────────────
         self.mixer_btns = {}
         cats = [
             (['34', '35', '36'], C_COL),
@@ -600,23 +995,22 @@ class LinupApp:
             content=ft.Column(controls=mixer_rows, spacing=2),
         )
 
-        # ── Controles ──────────────────────────────────────────────
         self.btn_inv = ft.ElevatedButton(
-            content=self._txt("INVERTIR"),
+            content=self._txt("INVEST"),
             on_click=self.confirmar_manual,
             expand=2, height=45,
             style=ft.ButtonStyle(bgcolor='#2ecc71', color=ft.Colors.WHITE,
                                  animation_duration=400),
         )
         btn_corr = ft.ElevatedButton(
-            content=self._txt("CORR"),
+            content=self._txt("UNDO"),
             on_click=self.corregir_ultimo,
             expand=1, height=45,
             style=ft.ButtonStyle(bgcolor='#f39c12', color=ft.Colors.WHITE,
                                  animation_duration=400),
         )
         btn_fin = ft.ElevatedButton(
-            content=self._txt("FINALIZAR"),
+            content=self._txt("FINISH"),
             on_click=self.finalizar_sesion,
             expand=1, height=45,
             style=ft.ButtonStyle(bgcolor='#e74c3c', color=ft.Colors.WHITE,
@@ -627,7 +1021,6 @@ class LinupApp:
             content=ft.Row(controls=[self.btn_inv, btn_corr, btn_fin], spacing=4),
         )
 
-        # ── Teclado numérico ───────────────────────────────────────
         teclado_controls = [
             ft.Row(controls=[
                 ft.ElevatedButton(
@@ -670,7 +1063,6 @@ class LinupApp:
             content=ft.Column(controls=teclado_controls, spacing=2),
         )
 
-        # ── Bitacora ───────────────────────────────────────────────
         self.reg_header_row = ft.Row(controls=[], spacing=0)
         self.reg_rows_box   = ft.Column(controls=[], spacing=0)
         self._rebuild_table_header()
@@ -688,13 +1080,12 @@ class LinupApp:
             ),
         )
 
-        # ── Layout final ───────────────────────────────────────────
         self._set_view(
             ft.Container(
                 bgcolor='#121212', expand=True,
                 content=ft.Column(
                     expand=True, spacing=0,
-                    controls=[
+                    controls=inv_bar_controls + [
                         mesa_bar, stats_bar, sug_bar,
                         mixer_box, ctrl_bar,
                         ft.Container(
@@ -710,7 +1101,7 @@ class LinupApp:
         self.actualizar_sugerencias()
 
     # ──────────────────────────────────────────────────────────────────
-    # BITACORA
+    # LOG TABLE
     # ──────────────────────────────────────────────────────────────────
     def _rebuild_table_header(self):
         cw = self._col_width()
@@ -768,7 +1159,7 @@ class LinupApp:
         self.page.update()
 
     # ──────────────────────────────────────────────────────────────────
-    # FEEDBACK VISUAL
+    # VISUAL FEEDBACK
     # ──────────────────────────────────────────────────────────────────
     def _darken_color(self, hex_color, factor=0.7):
         hex_color = hex_color.lstrip('#')
@@ -788,34 +1179,21 @@ class LinupApp:
         asyncio.create_task(_animate())
 
     # ──────────────────────────────────────────────────────────────────
-    # LÓGICA DE JUEGO
+    # GAME LOGIC
     # ──────────────────────────────────────────────────────────────────
 
-    # Grupos que se apuestan número a número con val_fin
     GRUPOS_STRAIGHT = {'Z0', 'ZG', 'ZP', 'H', 'T1', 'T2', 'T3'}
-
-    # Progresión para 2 grupos outside (columnas/docenas)
-    # Total bet × val_fout: 0.6, 1.8, 2.7, 5.4, 8.1, 16.2 ...
     PROG_2_OUT = [2, 6, 18, 54, 162, 486]
 
     def _is_outside(self):
-        """True si todos los grupos activos son columnas o docenas."""
         return all(g not in self.GRUPOS_STRAIGHT for g in self.grupos_activos)
 
     def _group_cost(self, g):
-        """
-        Costo base de UN grupo sin multiplicador de progresión.
-        - Columnas/docenas: val_fout
-        - Zonas/sectores:   val_fin × cantidad de números del grupo
-        """
         if g in self.GRUPOS_STRAIGHT:
             return self.val_fin * len(GRUPOS_MAESTROS[g])
         return self.val_fout
 
     def _compute_bet(self):
-        """
-        Devuelve (total_cost, per_group_win_payout) según tipo y progresión.
-        """
         n = len(self.grupos_activos)
         if n == 0:
             return 0.0, 0.0
@@ -929,7 +1307,7 @@ class LinupApp:
         self.lbl_inv.update()
 
     def _check_pre_bet_warning(self, on_confirm):
-        """Show warning if losing this bet would breach 33% stop loss. Calls on_confirm() if user proceeds."""
+        """Show warning if losing this bet would breach 33% stop loss."""
         if self.stop_loss_triggered or self.banca_inicial <= 0:
             on_confirm()
             return
@@ -952,7 +1330,7 @@ class LinupApp:
             self.page.update()
 
         dlg.title = ft.Text(
-            "⚠️ ADVERTENCIA",
+            "WARNING",
             color='#f39c12', size=16, weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
         )
@@ -961,22 +1339,22 @@ class LinupApp:
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
                 ft.Divider(color='#444444'),
-                ft.Text("Si pierdes esta apuesta:", color=ft.Colors.WHITE, size=13),
+                ft.Text("If you lose this bet:", color=ft.Colors.WHITE, size=13),
                 ft.Container(height=4),
                 ft.Text(f"Bank: ${potential_bank:.2f}", color='#e74c3c',
                         size=18, weight=ft.FontWeight.BOLD),
-                ft.Text(f"Pérdida: {loss_pct*100:.1f}%  (límite 33%)",
+                ft.Text(f"Loss: {loss_pct*100:.1f}%  (limit 33%)",
                         color='#e74c3c', size=13),
             ],
         )
         dlg.actions = [
             ft.ElevatedButton(
-                content=ft.Text("VOLVER", size=14, weight=ft.FontWeight.BOLD),
+                content=ft.Text("BACK", size=14, weight=ft.FontWeight.BOLD),
                 on_click=volver, expand=1,
                 style=ft.ButtonStyle(bgcolor='#555555', color=ft.Colors.WHITE),
             ),
             ft.ElevatedButton(
-                content=ft.Text("CONTINUAR", size=14, weight=ft.FontWeight.BOLD),
+                content=ft.Text("CONTINUE", size=14, weight=ft.FontWeight.BOLD),
                 on_click=continuar, expand=1,
                 style=ft.ButtonStyle(bgcolor='#e67e22', color=ft.Colors.WHITE),
             ),
@@ -997,10 +1375,7 @@ class LinupApp:
         self._check_pre_bet_warning(self._activate_bet)
 
     # ──────────────────────────────────────────────────────────────────
-    # SUGERENCIAS
-    # Condición para mostrar: el 2.º grupo supera en frecuencia al 3.º
-    # → cubre "dos iguales arriba" y "uno mayor+uno menor que el 3.º"
-    # Si los tres/cuatro están empatados → "---" (sin sugerencia)
+    # SUGGESTIONS
     # ──────────────────────────────────────────────────────────────────
     def _make_sug_handler(self, g_par):
         def handler(ev):
@@ -1019,7 +1394,7 @@ class LinupApp:
             faltan = 6 - len(self.sliding_window)
             self.sug_row.controls = [
                 ft.ElevatedButton(
-                    content=self._txt(f"({faltan} más)", size=12),
+                    content=self._txt(f"({faltan} more)", size=12),
                     expand=True, height=35,
                     style=ft.ButtonStyle(bgcolor='#34495e', color=ft.Colors.WHITE),
                 )
@@ -1037,8 +1412,6 @@ class LinupApp:
                  for g in grupos],
                 key=lambda x: x['p'], reverse=True,
             )
-            # Sugerencia válida solo si el #2 supera al #3
-            # Y nunca sugerir ZG+ZP (demasiadas fichas)
             PAIR_BLOQUEADO = {'ZG', 'ZP'}
             g_par_candidato = {stats[0]['g'], stats[1]['g']}
             es_par_bloqueado = g_par_candidato == PAIR_BLOQUEADO
@@ -1083,9 +1456,9 @@ class LinupApp:
             return
         if self.activa or self.grupos_activos:
             total, _ = self._compute_bet()
-            self.lbl_inv.value = f"INV: ${total:.2f}"
+            self.lbl_inv.value = f"BET: ${total:.2f}"
         else:
-            self.lbl_inv.value = "INV: $0.00"
+            self.lbl_inv.value = "BET: $0.00"
 
     def update_ui(self):
         if not self.lbl_bank:
@@ -1096,6 +1469,10 @@ class LinupApp:
         self.lbl_pl.value   = f"P/L: {pl_pct:+.1f}%"
         self.lbl_pl.color   = '#2ecc71' if pl >= 0 else '#e74c3c'
         self.update_inv_label()
+        if self.lbl_inv_pl:
+            total_pl = self.inv_other_pl + pl
+            self.lbl_inv_pl.value = f"P/L: {total_pl:+.2f}"
+            self.lbl_inv_pl.color = '#2ecc71' if total_pl >= 0 else '#e74c3c'
         self.page.update()
         self._check_stop_loss()
 
@@ -1117,7 +1494,7 @@ class LinupApp:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# PUNTO DE ENTRADA
+# ENTRY POINT
 # ──────────────────────────────────────────────────────────────────────
 def main(page: ft.Page):
     LinupApp(page)
