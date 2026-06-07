@@ -19,3 +19,8 @@ local.properties
 
 # Kotlin
 *.kt.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
