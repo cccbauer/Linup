@@ -1,7 +1,7 @@
 [project]
 name = "Linup"
-version = "18.2.0"
-description = "Linup Roulette Tracker"
+version = "19.1.20-AI"
+description = "Linup Roulette Tracker - AI Edition"
 requires-python = ">=3.10"
 dependencies = ["flet==0.80.5", "reportlab>=4.0.0"]
 
@@ -9,8 +9,10 @@ dependencies = ["flet==0.80.5", "reportlab>=4.0.0"]
 org = "com.linup"
 product = "Linup"
 company = "Linup"
-icon = "icon.png"
 bundle_id = "com.linup.app"
+# App icon is NOT configured here — Flet auto-discovers it by filename
+# inside assets/ (icon_android.png, or icon.png as a cross-platform
+# fallback). A top-level `icon = "..."` key here is a no-op.
 
 [tool.flet.macos]
 minimum_version = "12.0"

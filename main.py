@@ -8,7 +8,19 @@ from datetime import datetime
 import asyncio
 import csv
 import inspect
+import uuid
 from pathlib import Path
+
+# --- AI: combination-choice learning system ---
+from ai_game_state import GameStateExtractor
+from ai_strategy_model import StrategyModel, MIN_TRAINED_OBS
+from ai_rhythm import RhythmModel, RHYTHM_WARMUP
+from ai_pattern import PatternDetector, PATTERN_WARMUP
+try:
+    from ai_decision_tracker import DecisionTracker, Decision
+    _HAS_DECISION_TRACKER = True
+except Exception:
+    _HAS_DECISION_TRACKER = False
 
 # --- GROUP CONFIGURATION ---
 ROJOS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
@@ -38,6 +50,15 @@ GRUPOS_MAESTROS = {
     'Odd': {n for n in range(1, 37, 2)},
     '1-18': set(range(1, 19)),
     '19-36': set(range(19, 37)),
+}
+# Live Sessions mode: Z0/ZG/ZP/H sector zones widened with explicit wheel-
+# neighbour numbers (real-money bet coverage only — the base Z0/ZG/ZP/H above
+# stay an untouched partition for SECTOR_OF / DOZEN_SECTOR_AFFINITY below).
+GRUPOS_SECTOR_LS = {
+    'Z0': GRUPOS_MAESTROS['Z0'] | {19, 28},
+    'ZG': GRUPOS_MAESTROS['ZG'] | {12, 15, 9, 17},
+    'ZP': GRUPOS_MAESTROS['ZP'] | {1, 6},
+    'H':  GRUPOS_MAESTROS['H']  | {27, 33, 22, 25},
 }
 PROG_FIBO = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55]
 C_COL, C_DOC, C_SEC, C_SET, C_WAV = '#00d2ff', '#2ecc71', '#e67e22', '#9b59b6', '#e91e63'
@@ -114,6 +135,119 @@ DOZEN_SECTOR_AFFINITY = {
     for _d in ('1a', '2a', '3a')
 }
 
+# ── Dozen-CONDITIONED colour picker (COND) ───────────────────────────────────
+# Colour the live dozen suggestion by which colour-half of the SUGGESTED dozen
+# has been landing more over the recent window — committing only when the lean
+# clears a margin, else staying dozen-only. This beats reading the raw B/R
+# stream (the old PatternDetector overlay) because the exploitable edge is a
+# joint dozen×colour property, not a property of the colour sequence alone.
+# Validated per-dealer in ai_combo_eval.py (net-chip terms under the 1/3/5
+# progression). The window is a live sliding read, so it self-adapts every
+# session; re-tune the two constants as more sessions are logged with:
+#     python3 ai_combo_eval.py --sweep ~/linup_data/croupier_log.txt
+COND_WINDOW = 12     # recent spins considered
+COND_MARGIN = 0.15   # |frac_red_in_dozen - 0.5| must exceed this to commit
+COND_MIN    = 4      # need at least this many in-dozen landings for a read
+
+
+def cond_color_for(dozen, history):
+    """'R' / 'B' / None — the colour to append to a live dozen suggestion.
+
+    Looks only at spins that landed in `dozen`'s live colour groups over the
+    recent window; returns None (stay dozen-only) unless one colour clears the
+    margin. Reuses GRUPOS_MAESTROS so the covered numbers never drift from the
+    bet the app actually places (incl. the 0 folded into 3a groups)."""
+    reds = GRUPOS_MAESTROS.get(f'{dozen}_LR', ())
+    blacks = GRUPOS_MAESTROS.get(f'{dozen}_LB', ())
+    recent = history[-COND_WINDOW:] if history else []
+    r = sum(1 for n in recent if n in reds)
+    b = sum(1 for n in recent if n in blacks)
+    tot = r + b
+    if tot < COND_MIN:
+        return None
+    frac = r / tot
+    if frac >= 0.5 + COND_MARGIN:
+        return 'R'
+    if frac <= 0.5 - COND_MARGIN:
+        return 'B'
+    return None
+
+
+# ── RHYTHM-vs-STREAK-vs-BIAS colour picker (RVS) — the deployed overlay ───────
+# Classifies the croupier's recent colour regime and rides / flips accordingly:
+#   BIAS   (>=65% one colour in window)      -> ride the dominant colour
+#   STREAK (current run >= RIDE_LEN, or high P(repeat)) -> ride the run
+#   RHYTHM (short runs, low P(repeat))                  -> flip (a break is due)
+#   else                                                -> no colour (dozen only)
+# Replaced COND as the overlay: under the real 1x-2x-3x combo (chip-in)
+# progression and the player's 2% max-loss cap, RVS is the best risk-adjusted
+# colour picker we have — it covers ~14 numbers (max loss ~1.3% of bank) vs the
+# bare dozen's ~28 (~1.8%), so the combo can be sized up within the 2% budget.
+# Encodes the operator's own read (bias / streak / rhythm). PROVISIONAL: tuned
+# in-sample on ~13 dealers; re-validate held-out as sessions accrue via
+#     python3 ai_combo_eval.py --sweep-rvs ~/linup_data/croupier_log.txt
+RVS_WINDOW, RVS_STREAK_THR, RVS_RHYTHM_THR = 12, 0.60, 0.40
+RVS_MIN, RVS_RHYTHM_RUN, RVS_RIDE_LEN, RVS_BIAS_MARGIN = 6, 2, 4, 0.15
+# Live, TUNABLE config. The deployed values above are the defaults; a validated
+# candidate the player applies from the Bet Eval page overwrites this dict (and
+# is persisted to linup_data/rvs_config.json, reloaded at startup). Never
+# auto-applied — only on explicit approval after passing a held-out test.
+RVS_CFG = {'window': RVS_WINDOW, 'streak': RVS_STREAK_THR, 'rhythm': RVS_RHYTHM_THR,
+           'min': RVS_MIN, 'rhythm_run': RVS_RHYTHM_RUN, 'ride_len': RVS_RIDE_LEN,
+           'bias': RVS_BIAS_MARGIN}
+
+
+def _regime(history, cfg=None):
+    """Classify the recent colour regime under `cfg` (defaults to live RVS_CFG).
+    Returns (pred_bit|None, kind, detail); kind in
+    'watching' / 'BIAS' / 'STREAK' / 'RHYTHM' / 'none'."""
+    c = cfg or RVS_CFG
+    cols = [1 if n in ROJOS else 0 for n in history if n != 0][-int(c['window']):]
+    if len(cols) < c['min']:
+        return (None, 'watching', {'n': len(cols)})
+    reps = sum(cols[i] == cols[i - 1] for i in range(1, len(cols)))
+    prep = reps / (len(cols) - 1)
+    frac_red = sum(cols) / len(cols)
+    last = cols[-1]
+    run = 1
+    for i in range(len(cols) - 2, -1, -1):
+        if cols[i] == last:
+            run += 1
+        else:
+            break
+    if abs(frac_red - 0.5) >= c['bias']:            # BIAS: ride dominant
+        return (1 if frac_red > 0.5 else 0, 'BIAS', {'frac': frac_red})
+    if run >= c['ride_len']:                        # STREAK now: ride run
+        return (last, 'STREAK', {'run': run})
+    if prep >= c['streak'] and run >= 2:            # streaky: ride
+        return (last, 'STREAK', {'run': run})
+    if prep <= c['rhythm'] and run >= c['rhythm_run']:  # rhythmic: flip
+        return (1 - last, 'RHYTHM', {'run': run})
+    return (None, 'none', {'prep': prep, 'frac': frac_red})
+
+
+def regime_color(history, cfg=None):
+    """'R' / 'B' / None — colour to append to the live dozen suggestion."""
+    pred, _, _ = _regime(history, cfg)
+    if pred is None:
+        return None
+    return 'R' if pred == 1 else 'B'
+
+
+def regime_status(history):
+    """Human-readable one-liner for the AI bar, reflecting the RVS overlay."""
+    pred, kind, d = _regime(history)
+    col = 'R' if pred == 1 else ('B' if pred == 0 else None)
+    if kind == 'watching':
+        return f"watching… {d['n']}/{RVS_MIN} colours"
+    if kind == 'BIAS':
+        return f"BIAS {int(round(max(d['frac'], 1 - d['frac']) * 100))}% → bet {col}"
+    if kind == 'STREAK':
+        return f"STREAK ×{d['run']} → ride {col}"
+    if kind == 'RHYTHM':
+        return f"RHYTHM → flip {col}"
+    return "no clear regime — dozen only"
+
 
 class LinupApp:
     def __init__(self, page: ft.Page):
@@ -125,13 +259,19 @@ class LinupApp:
         self.lbl_pl   = None
         self.sug_row  = None
         self.btn_inv  = None
+        self.btn_tune = None
         self.reg_rows_box   = None
         self.reg_header_row = None
         self._on_game_screen = False
         self.current_investment_id = None
         self.lbl_inv_pl = None
 
-        self.page.title      = "Linup v18.2.0"
+        self.page.title      = "Linup v19.1.20-AI"
+        self.page.window.icon = "app_icon.png"   # no-op on macOS in flet>=0.80
+                                                   # (Window.icon is Windows-only
+                                                   # now); real app icon comes
+                                                   # from assets/icon.png via
+                                                   # `flet build macos`
         self.page.theme_mode = ft.ThemeMode.DARK
         self.page.bgcolor    = '#1a1a1a'
         self.page.padding    = 0
@@ -179,7 +319,37 @@ class LinupApp:
         self.show_splash()
         self.init_db()
         self.reset_variables()
+        self._init_ai_systems()      # AI: combination-choice learning
         self.page.run_task(self._after_splash)
+
+    def _init_ai_systems(self):
+        """Initialise the AI that learns how the player picks combinations.
+
+        Everything is wrapped so the app keeps working even if the AI fails.
+        """
+        self.ai_ok = False
+        self.current_choice = None      # snapshot held between bet and result
+        self.current_decision_id = None
+        self.spins_since_entry = 0      # adaptive line-up wait counter
+        self.rhythm_model = None        # live B/R rhythm predictor (per croupier)
+        self.pattern_model = None       # observe-20-then-commit colour pattern
+        try:
+            self.state_extractor = GameStateExtractor(GRUPOS_MAESTROS,
+                                                      WHEEL_NEIGHBORS)
+            self.strategy_model = StrategyModel(self.db_path, self.state_extractor)
+            self.rhythm_model = RhythmModel(ROJOS)
+            self.pattern_model = PatternDetector(ROJOS)
+            if _HAS_DECISION_TRACKER:
+                try:
+                    self.decision_tracker = DecisionTracker(db_path=self.db_path)
+                except Exception:
+                    self.decision_tracker = None
+            else:
+                self.decision_tracker = None
+            self.ai_ok = True
+        except Exception as e:
+            print(f"AI init warning: {e}")
+            self.ai_ok = False
 
     async def _after_splash(self):
         await asyncio.sleep(4.0)
@@ -193,6 +363,14 @@ class LinupApp:
             label, size=size,
             weight=ft.FontWeight.BOLD if bold else ft.FontWeight.NORMAL,
             text_align=ft.TextAlign.CENTER,
+        )
+
+    def _fit_btn_txt(self, label, size=12):
+        """Button label sized to fit a narrow shared-row button without
+        clipping; wraps a two-word label onto a second line instead."""
+        return ft.Text(
+            label, size=size, weight=ft.FontWeight.BOLD,
+            text_align=ft.TextAlign.CENTER, no_wrap=False, max_lines=2,
         )
 
     # ──────────────────────────────────────────────────────────────────
@@ -338,6 +516,14 @@ class LinupApp:
                 continue
         if not self.db_path:
             self.db_error = f"All paths failed. Last: {self.db_error}"
+        # Load any user-applied RVS tuning + entry-policy (from the Bet Eval
+        # page). Never auto-set — only what the player previously approved.
+        self.entry_policy = None
+        try:
+            self._load_rvs_config()
+            self.entry_policy = self._load_entry_policy()
+        except Exception:
+            pass
 
     def _get_conn(self):
         if not self.db_path:
@@ -536,8 +722,14 @@ class LinupApp:
         self.stop_loss_triggered  = False
         self.goal_achieved_shown  = False
         self.activa               = False
+        self.tune_activa          = False  # TUNE: pending practice selection, no bank impact
+        self.tune_hits            = 0
+        self.tune_total           = 0
+        self.last_was_tune        = False  # so UNDO can revert the stat above
+        self.last_tune_hit        = False
         self.free_spin_mode       = False
         self.live_table_mode      = False
+        self.live_sessions_mode   = False
         self.live_filter          = None   # None, 'R', 'B'
         self.prog_on              = True   # progression on/off
         self.sniper_mode          = True   # sniper mode on/off (intersection of groups) - default ON
@@ -546,10 +738,16 @@ class LinupApp:
         self.grupos_activos       = []
         self.history_nums         = []
         self.sliding_window       = deque(maxlen=6)
+        # New session/croupier → forget the previous reads.
+        if getattr(self, 'rhythm_model', None):
+            self.rhythm_model.reset()
+        if getattr(self, 'pattern_model', None):
+            self.pattern_model.reset()
         self.val_fin              = 0.10
         self.val_fout             = 0.30
         self.nombre_mesa          = "TABLE 1"
         self.session_id           = None
+        self.play_session_id      = None   # unique per play session (bet log)
         self.inv_name             = ""
         self.inv_capital          = 0.0
         self.chip_usd_rate        = 0.0   # USD per chip (CHIPS investments)
@@ -573,6 +771,21 @@ class LinupApp:
             if rate > 0:
                 return f"{int(round(val)):,} (${val * rate:,.2f})"
             return f"{int(round(val)):,}"
+        return f"${val:.2f}"
+
+    def _fmt_chip(self, val: float) -> str:
+        """Bet total: chips with USD equivalent in parens (CHIPS) or plain $ (FIAT)."""
+        if self.inv_type == 'CHIPS':
+            rate = getattr(self, 'chip_usd_rate', 0.0)
+            if rate > 0:
+                return f"{val:.2f} chips (${val * rate:.2f})"
+            return f"{val:.2f} chips"
+        return f"${val:.2f}"
+
+    def _fmt_chip_plain(self, val: float) -> str:
+        """Per-chip / breakdown amount: bare chip count (CHIPS) or plain $ (FIAT)."""
+        if self.inv_type == 'CHIPS':
+            return f"{val:.2f} chips"
         return f"${val:.2f}"
 
     # ──────────────────────────────────────────────────────────────────
@@ -679,7 +892,7 @@ class LinupApp:
                         ft.Container(height=16),
                         ft.Image(src="roulette.gif", width=200, height=200),
                         ft.Container(height=16),
-                        ft.Text("v18.2.0", color='#7f8c8d', size=18),
+                        ft.Text("v19.1.20-AI", color='#9b59b6', size=18),
                         ft.Container(height=48),
                         ft.ProgressRing(color='#3498db', width=36, height=36,
                                         stroke_width=3),
@@ -1422,29 +1635,46 @@ class LinupApp:
                                    iid=investment_id, it=db_inv_type):
                     self.show_edit_sessions(iid, n, c, it)
 
+                def _open_bet_eval(_, iid=investment_id):
+                    self.show_bet_eval_view(iid)
+
                 table_rows.append(ft.Container(height=6))
                 table_rows.append(
                     ft.Row(
                         controls=[
                             ft.ElevatedButton(
-                                "COMPOUND GROWTH",
+                                content=self._fit_btn_txt("COMPOUND GROWTH"),
                                 on_click=_open_projection,
                                 expand=True, height=45,
                                 style=ft.ButtonStyle(bgcolor='#2980b9',
                                                      color=ft.Colors.WHITE),
                             ),
                             ft.ElevatedButton(
-                                "ACTUAL GRAPH",
+                                content=self._fit_btn_txt("ACTUAL GRAPH"),
                                 on_click=_open_graph,
                                 expand=True, height=45,
                                 style=ft.ButtonStyle(bgcolor='#6c3483',
                                                      color=ft.Colors.WHITE),
                             ),
                             ft.ElevatedButton(
-                                "EDIT SESSIONS",
+                                content=self._fit_btn_txt("EDIT SESSIONS"),
                                 on_click=_edit_sessions,
                                 expand=True, height=45,
                                 style=ft.ButtonStyle(bgcolor='#d35400',
+                                                     color=ft.Colors.WHITE),
+                            ),
+                        ],
+                        spacing=8,
+                    )
+                )
+                table_rows.append(
+                    ft.Row(
+                        controls=[
+                            ft.ElevatedButton(
+                                content=self._fit_btn_txt("AI BET EVAL"),
+                                on_click=_open_bet_eval,
+                                expand=True, height=45,
+                                style=ft.ButtonStyle(bgcolor='#16a085',
                                                      color=ft.Colors.WHITE),
                             ),
                         ],
@@ -1959,6 +2189,833 @@ class LinupApp:
     # ──────────────────────────────────────────────────────────────────
     # ACTUAL GROWTH GRAPH
     # ──────────────────────────────────────────────────────────────────
+    def _read_bet_log(self) -> list:
+        """Load all per-spin records from bet_log.jsonl (best-effort)."""
+        import json
+        rows = []
+        path = (os.path.join(os.path.dirname(self.db_path), 'bet_log.jsonl')
+                if getattr(self, 'db_path', None) else None)
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                rows.append(json.loads(line))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+        return rows
+
+    def _compute_bet_eval(self) -> dict:
+        """Analyse the real-bet log (bet_log.jsonl) — the player's realized entry
+        decisions and outcomes. Returns a stats dict, or {'empty': True}."""
+        rows = self._read_bet_log()
+        if not rows:
+            return {'empty': True}
+
+        def roi(rs):
+            cost = sum(r.get('cost', 0) or 0 for r in rs)
+            net = sum(r.get('delta', 0) or 0 for r in rs)
+            return net, cost, (100 * net / cost if cost else 0.0)
+
+        def winrate(rs):
+            g = [r for r in rs if r.get('is_win') is not None]
+            if not g:
+                return None
+            return 100 * sum(1 for r in g if r['is_win']) / len(g)
+
+        def block(rs):
+            n, c, ro = roi(rs)
+            return {'entries': len(rs), 'win': winrate(rs), 'net': n, 'roi': ro}
+
+        scoreboard = self._suggestion_scoreboard(rows)
+        acted = [r for r in rows if r.get('acted')]
+        passed = [r for r in rows if not r.get('acted')]
+        sug = [r for r in rows if (r.get('suggested') or {}).get('dozen')]
+        waits = [r.get('spins_since_entry') for r in acted
+                 if isinstance(r.get('spins_since_entry'), int)]
+        by_regime = {}
+        for r in acted:
+            by_regime.setdefault((r.get('regime') or {}).get('kind', '?'), []).append(r)
+        regimes = [dict(kind=k, **block(rs))
+                   for k, rs in sorted(by_regime.items(), key=lambda kv: -len(kv[1]))]
+        graded = sum(1 for r in acted if r.get('is_win') is not None)
+        return {
+            'empty': False,
+            'spins': len(rows), 'entered': len(acted), 'passed': len(passed),
+            'entry_rate': 100 * len(acted) / len(rows),
+            'sug_shown': len(sug), 'sug_entered': sum(1 for r in sug if r.get('acted')),
+            'avg_wait': (sum(waits) / len(waits) if waits else None),
+            'graded': graded, **{k: v for k, v in zip(('net', 'staked', 'roi'), roi(acted))},
+            'win': winrate(acted),
+            'regimes': regimes,
+            'followed': block([r for r in acted if r.get('followed_suggestion')]),
+            'freelanced': block([r for r in acted if not r.get('followed_suggestion')]),
+            'scoreboard': scoreboard,
+        }
+
+    def _suggestion_scoreboard(self, rows) -> list:
+        """Counterfactual: for every logged spin, score EACH category's on-screen
+        suggestion against the real outcome under the 1/2/3 chip-in progression
+        (straight-up 35:1). Answers 'which suggestion types actually pay'. Uses
+        the logged number sequence per session; needs records that carry the
+        'suggestions' field (logged from v19.0.1+). Returns [] if none do."""
+        PROG = (1, 2, 3)
+        sessions = {}
+        for r in rows:
+            sessions.setdefault(r.get('session'), []).append(r)
+        cats = {}
+        for _sid, rs in sessions.items():
+            rs = sorted(rs, key=lambda r: r.get('spin', 0))
+            nums = [r.get('num') for r in rs]
+            for i, r in enumerate(rs):
+                sug = r.get('suggestions')
+                if not sug or i + 3 > len(nums):   # need this spin + 2 forward
+                    continue
+                window = nums[i:i + 3]
+                for cat, groups in sug.items():
+                    if not groups:
+                        continue
+                    covered = set()
+                    for g in groups:
+                        covered |= GRUPOS_MAESTROS.get(g, set())
+                    if not covered:
+                        continue
+                    K = len(covered)
+                    pl, hit, staked = 0, False, 0
+                    for stake, spin in zip(PROG, window):
+                        pl -= stake * K
+                        staked += stake * K
+                        if spin in covered:
+                            pl += 36 * stake
+                            hit = True
+                            break
+                    d = cats.setdefault(cat, {'entries': 0, 'hits': 0,
+                                              'net': 0, 'staked': 0, 'cov': 0})
+                    d['entries'] += 1
+                    d['hits'] += int(hit)
+                    d['net'] += pl
+                    d['staked'] += staked
+                    d['cov'] += K
+        out = []
+        for cat, d in cats.items():
+            e = d['entries']
+            if not e:
+                continue
+            out.append({'cat': cat, 'entries': e,
+                        'hitrate': 100 * d['hits'] / e,
+                        'roi': 100 * d['net'] / d['staked'] if d['staked'] else 0.0,
+                        'net': d['net'], 'avg_cov': d['cov'] / e})
+        out.sort(key=lambda x: -x['roi'])
+        return out
+
+    # ── persistence for user-applied tuning / entry policy ───────────────────
+    def _cfg_path(self, name):
+        return (os.path.join(os.path.dirname(self.db_path), name)
+                if getattr(self, 'db_path', None) else None)
+
+    def _load_rvs_config(self):
+        import json
+        p = self._cfg_path('rvs_config.json')
+        if p and os.path.exists(p):
+            with open(p, encoding='utf-8') as f:
+                cfg = json.load(f)
+            for k in list(RVS_CFG.keys()):
+                if k in cfg:
+                    RVS_CFG[k] = cfg[k]
+
+    def _save_rvs_config(self, cfg):
+        import json
+        RVS_CFG.clear()
+        RVS_CFG.update(cfg)
+        p = self._cfg_path('rvs_config.json')
+        if p:
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f)
+
+    def _load_entry_policy(self):
+        import json
+        p = self._cfg_path('entry_policy.json')
+        if p and os.path.exists(p):
+            with open(p, encoding='utf-8') as f:
+                d = json.load(f)
+            ks = d.get('kinds')
+            return set(ks) if ks else None
+        return None
+
+    def _save_entry_policy(self, kinds):
+        import json
+        self.entry_policy = set(kinds) if kinds else None
+        p = self._cfg_path('entry_policy.json')
+        if p:
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump({'kinds': sorted(kinds) if kinds else []}, f)
+
+    # ── #1: validated RVS auto-tune (train/test, never auto-applied) ─────────
+    def _load_dealer_sequences(self):
+        """[(label,[nums])] from croupier_log.txt + bundled croupier_data.txt."""
+        import re
+        seqs, paths = [], []
+        if getattr(self, 'db_path', None):
+            paths.append(os.path.join(os.path.dirname(self.db_path), 'croupier_log.txt'))
+        paths.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'croupier_data.txt'))
+        for path in paths:
+            if not path or not os.path.exists(path):
+                continue
+            label, nums = None, []
+            try:
+                for raw in open(path, encoding='utf-8'):
+                    line = raw.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if line.startswith('@'):
+                        if nums:
+                            seqs.append((label or f'd{len(seqs)+1}', nums))
+                        label, nums = line[1:].strip() or None, []
+                    else:
+                        nums.extend(int(x) for x in re.findall(r'\d+', line)
+                                    if 0 <= int(x) <= 36)
+                if nums:
+                    seqs.append((label or f'd{len(seqs)+1}', nums))
+            except Exception:
+                pass
+        return seqs
+
+    @staticmethod
+    def _pick_dozen_sa(window6):
+        sc = {d: sum(DOZEN_SECTOR_AFFINITY[d].get(SECTOR_OF.get(n), 0.0)
+                     for n in window6) / 6.0 for d in ('1a', '2a', '3a')}
+        ranked = sorted(sc.items(), key=lambda kv: kv[1], reverse=True)
+        if ranked[0][1] <= 0 or abs(ranked[0][1] - ranked[1][1]) < 1e-9:
+            return None
+        return ranked[0][0]
+
+    def _eval_rvs(self, dealers, cfg):
+        """Net chips & staked over dealers: sector dozen + RVS(cfg) colour, ridden
+        under the 1/2/3 chip-in progression (straight-up 35:1)."""
+        PROG = (1, 2, 3)
+        net = staked = 0
+        for _lbl, nums in dealers:
+            for i in range(6, len(nums) - 2):
+                dozen = self._pick_dozen_sa(nums[i - 6:i])
+                if not dozen:
+                    continue
+                color = regime_color(nums[:i], cfg)
+                cov = GRUPOS_MAESTROS.get(f'{dozen}{_DOC_SFX.get(color, "_L")}')
+                if not cov:
+                    continue
+                K = len(cov)
+                for stake, spin in zip(PROG, nums[i:i + 3]):
+                    net -= stake * K
+                    staked += stake * K
+                    if spin in cov:
+                        net += 36 * stake
+                        break
+        return net, staked
+
+    def _tune_rvs_candidate(self, min_dealers=8, confident_test=20):
+        """Fit RVS thresholds on a train split, validate on a held-out split.
+        Returns the candidate + its held-out ROI vs the current config's.
+        'confident' is False when the held-out set is too thin to trust the
+        result yet (still 'ok' — just flagged WAIT rather than hidden)."""
+        dealers = self._load_dealer_sequences()
+        if len(dealers) < min_dealers:
+            return {'ok': False,
+                    'reason': f'need ≥{min_dealers} dealers, have {len(dealers)}'}
+        train = [d for i, d in enumerate(dealers) if i % 2 == 0]
+        test = [d for i, d in enumerate(dealers) if i % 2 == 1]
+
+        def roi(ds, cfg):
+            n, s = self._eval_rvs(ds, cfg)
+            return (100 * n / s if s else 0.0)
+
+        best = None
+        for streak in (0.55, 0.60, 0.65):
+            for rhythm in (0.30, 0.35, 0.40):
+                for ride in (4, 5):
+                    for bias in (0.12, 0.15, 0.20):
+                        cfg = {**RVS_CFG, 'streak': streak, 'rhythm': rhythm,
+                               'ride_len': ride, 'bias': bias}
+                        r = roi(train, cfg)
+                        if best is None or r > best[0]:
+                            best = (r, cfg)
+        cand = best[1]
+        cand_roi = roi(test, cand)
+        cur_roi = roi(test, dict(RVS_CFG))
+        return {'ok': True, 'n_train': len(train), 'n_test': len(test),
+                'candidate': cand, 'cand_test_roi': cand_roi,
+                'cur_test_roi': cur_roi, 'improvement': cand_roi - cur_roi,
+                'confident': len(test) >= confident_test}
+
+    # ── #2: entry-policy learning (train/test on the player's real bets) ─────
+    def _learn_entry_policy_candidate(self, min_entries=20, min_per_kind=5,
+                                      train_frac=0.6, confident_test=40,
+                                      confident_kind=15):
+        """From real bets: learn which regimes the player's ENTRIES win in on the
+        earlier bets, then check filtering to those regimes improves ROI on the
+        LATER (held-out) bets. Temporal past→future split — works within a single
+        session and is the honest test for an entry policy.
+        'confident' is False when the held-out set or the thinnest recommended
+        regime is too small to trust yet (still 'ok' — just flagged WAIT)."""
+        acted = [r for r in self._read_bet_log()
+                 if r.get('acted') and r.get('is_win') is not None]
+        if len(acted) < min_entries:
+            return {'ok': False,
+                    'reason': f'need ≥{min_entries} graded entries, have {len(acted)}'}
+        cut = max(1, int(len(acted) * train_frac))
+        train, test = acted[:cut], acted[cut:]
+        if not test:
+            return {'ok': False,
+                    'reason': 'not enough entries to hold out a test set'}
+
+        def roi(rs):
+            c = sum(r.get('cost', 0) or 0 for r in rs)
+            n = sum(r.get('delta', 0) or 0 for r in rs)
+            return (100 * n / c if c else 0.0)
+
+        bykind = {}
+        for r in train:
+            bykind.setdefault((r.get('regime') or {}).get('kind', '?'), []).append(r)
+        policy = {k for k, rs in bykind.items()
+                  if len(rs) >= min_per_kind and roi(rs) > 0}
+        test_all = roi(test)
+        test_pol = roi([r for r in test
+                        if (r.get('regime') or {}).get('kind', '?') in policy])
+        train_bykind = {k: (len(rs), roi(rs)) for k, rs in bykind.items()}
+        min_kind_n = min((train_bykind[k][0] for k in policy), default=0)
+        return {'ok': True, 'policy': sorted(policy),
+                'train_bykind': train_bykind,
+                'test_all_roi': test_all, 'test_policy_roi': test_pol,
+                'improvement': test_pol - test_all,
+                'n_train': len(train), 'n_test': len(test),
+                'confident': (len(test) >= confident_test
+                              and min_kind_n >= confident_kind)}
+
+    # AI-learned tables (StrategyModel + DecisionTracker) — NOT the core
+    # financial tables (sesiones, investments, ...), which must never be
+    # touched by a "clear AI memory" action.
+    _AI_DB_TABLES = ('strategy_combo_stats', 'strategy_feature_stats',
+                     'strategy_setup_stats', 'strategy_wait',
+                     'decisions', 'decision_feedback', 'learned_patterns')
+    _AI_FLAT_FILES = ('bet_log.jsonl', 'entry_policy.json', 'rvs_config.json',
+                      'croupier_log.txt')
+
+    def _stash_and_clear_ai_memory(self):
+        """Back up every AI-learned artifact (the 7 strategy/decision-tracker
+        DB tables + bet_log/entry_policy/rvs_config/croupier_log files) to a
+        timestamped folder under ~/linup_data/stash/, then wipe the live
+        copies and re-init the AI so the running app reflects it immediately.
+        Core financial tables (sessions, investments, ...) are never touched.
+        Returns the stash dir path, or None on failure (nothing is cleared
+        if the backup step fails)."""
+        import json
+        if not getattr(self, 'db_path', None):
+            return None
+        base_dir = os.path.dirname(self.db_path)
+        try:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        except Exception:
+            ts = '0'
+        stash_dir = os.path.join(base_dir, 'stash', ts)
+        try:
+            os.makedirs(stash_dir, exist_ok=True)
+
+            # 1) back up the AI DB tables to JSON, then delete their rows.
+            conn = self._get_conn()
+            if conn is None:
+                return None
+            try:
+                cur = conn.cursor()
+                for table in self._AI_DB_TABLES:
+                    cur.execute(f"SELECT * FROM {table}")
+                    cols = [d[0] for d in cur.description]
+                    dump = [dict(zip(cols, row)) for row in cur.fetchall()]
+                    with open(os.path.join(stash_dir, f'{table}.json'), 'w',
+                             encoding='utf-8') as f:
+                        json.dump(dump, f)
+                for table in self._AI_DB_TABLES:
+                    cur.execute(f"DELETE FROM {table}")
+                conn.commit()
+            finally:
+                conn.close()
+
+            # 2) back up + remove the flat AI files.
+            import shutil
+            for name in self._AI_FLAT_FILES:
+                p = os.path.join(base_dir, name)
+                if os.path.exists(p):
+                    shutil.copy2(p, os.path.join(stash_dir, name))
+                    os.remove(p)
+        except Exception:
+            return None
+
+        # 3) reset live in-memory state so the running app reflects the
+        # clear immediately, not just after a restart.
+        RVS_CFG.clear()
+        RVS_CFG.update({'window': RVS_WINDOW, 'streak': RVS_STREAK_THR,
+                        'rhythm': RVS_RHYTHM_THR, 'min': RVS_MIN,
+                        'rhythm_run': RVS_RHYTHM_RUN, 'ride_len': RVS_RIDE_LEN,
+                        'bias': RVS_BIAS_MARGIN})
+        self.entry_policy = None
+        try:
+            self._init_ai_systems()
+        except Exception:
+            pass
+        return stash_dir
+
+    def _export_bet_eval_csv(self):
+        """Write the Bet Eval stats + raw per-spin bet log to a shareable CSV.
+        Saves to ~/Downloads (fallback: next to the DB, then home). Returns path
+        or None."""
+        import csv as _csv
+        s = self._compute_bet_eval()
+        log_rows = self._read_bet_log()
+        try:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        except Exception:
+            ts = '0'
+        dl = os.path.join(os.path.expanduser('~'), 'Downloads')
+        base = (dl if os.path.isdir(dl)
+                else (os.path.dirname(self.db_path) if getattr(self, 'db_path', None)
+                      else os.path.expanduser('~')))
+        path = os.path.join(base, f"LinupOS_BetEval_{ts}.csv")
+        try:
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                w = _csv.writer(f)
+                w.writerow(['LINUP BET EVAL EXPORT'])
+                try:
+                    w.writerow(['Export date',
+                                datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
+                except Exception:
+                    pass
+                w.writerow([])
+                if not s.get('empty'):
+                    w.writerow(['ENTRY BEHAVIOUR'])
+                    w.writerow(['spins', s['spins']])
+                    w.writerow(['entered', s['entered']])
+                    w.writerow(['entry_rate_pct', f"{s['entry_rate']:.1f}"])
+                    w.writerow(['passed', s['passed']])
+                    w.writerow(['suggestion_shown', s['sug_shown']])
+                    w.writerow(['suggestion_entered', s['sug_entered']])
+                    if s['avg_wait'] is not None:
+                        w.writerow(['avg_wait_spins', f"{s['avg_wait']:.1f}"])
+                    w.writerow([])
+                    w.writerow(['REALIZED RESULTS (bets placed)'])
+                    w.writerow(['entries', s['entered']])
+                    w.writerow(['win_rate_pct',
+                                '' if s['win'] is None else f"{s['win']:.0f}"])
+                    w.writerow(['net', f"{s['net']:.2f}"])
+                    w.writerow(['staked', f"{s['staked']:.2f}"])
+                    w.writerow(['roi_pct', f"{s['roi']:.2f}"])
+                    w.writerow([])
+                    w.writerow(['BY REGIME', 'entries', 'win_pct', 'net', 'roi_pct'])
+                    for rr in s['regimes']:
+                        w.writerow([rr['kind'], rr['entries'],
+                                    '' if rr['win'] is None else f"{rr['win']:.0f}",
+                                    f"{rr['net']:.2f}", f"{rr['roi']:.1f}"])
+                    w.writerow([])
+                    w.writerow(['FOLLOWED vs FREELANCED', 'entries', 'win_pct',
+                                'net', 'roi_pct'])
+                    for lbl, b in (('followed', s['followed']),
+                                   ('freelanced', s['freelanced'])):
+                        w.writerow([lbl, b['entries'],
+                                    '' if b['win'] is None else f"{b['win']:.0f}",
+                                    f"{b['net']:.2f}", f"{b['roi']:.1f}"])
+                    w.writerow([])
+                    w.writerow(['SUGGESTION SCOREBOARD', 'entries',
+                                'hit_within3_pct', 'roi_pct'])
+                    for sc in s.get('scoreboard', []):
+                        w.writerow([sc['cat'], sc['entries'],
+                                    f"{sc['hitrate']:.0f}", f"{sc['roi']:.1f}"])
+                    w.writerow([])
+                cand = self._tune_rvs_candidate()
+                w.writerow(['RVS TUNING (held-out)'])
+                if cand.get('ok'):
+                    w.writerow(['confidence',
+                                'OK' if cand.get('confident') else 'WAIT - small sample'])
+                    w.writerow(['n_train_dealers', cand['n_train']])
+                    w.writerow(['n_test_dealers', cand['n_test']])
+                    w.writerow(['current_heldout_roi_pct', f"{cand['cur_test_roi']:.2f}"])
+                    w.writerow(['candidate_heldout_roi_pct', f"{cand['cand_test_roi']:.2f}"])
+                    w.writerow(['improvement_pct', f"{cand['improvement']:.2f}"])
+                    c = cand['candidate']
+                    w.writerow(['candidate_cfg',
+                                f"streak>={c['streak']} rhythm<={c['rhythm']} "
+                                f"ride>={c['ride_len']} bias>={c['bias']}"])
+                else:
+                    w.writerow(['status', cand.get('reason', '')])
+                w.writerow([])
+                pol = self._learn_entry_policy_candidate()
+                w.writerow(['ENTRY POLICY (held-out)'])
+                if pol.get('ok'):
+                    w.writerow(['confidence',
+                                'OK' if pol.get('confident') else 'WAIT - small sample'])
+                    w.writerow(['n_train_entries', pol['n_train']])
+                    w.writerow(['n_test_entries', pol['n_test']])
+                    w.writerow(['recommended_regimes',
+                                ', '.join(pol['policy']) or '(none)'])
+                    w.writerow(['test_all_roi_pct', f"{pol['test_all_roi']:.1f}"])
+                    w.writerow(['test_filtered_roi_pct', f"{pol['test_policy_roi']:.1f}"])
+                    w.writerow(['improvement_pct', f"{pol['improvement']:.1f}"])
+                    w.writerow(['regime', 'train_entries', 'train_roi_pct'])
+                    for k, (nk, rk) in sorted(pol['train_bykind'].items(),
+                                              key=lambda kv: -kv[1][1]):
+                        w.writerow([k, nk, f"{rk:.1f}"])
+                else:
+                    w.writerow(['status', pol.get('reason', '')])
+                w.writerow([])
+                w.writerow(['RAW BETS (one row per spin)'])
+                w.writerow(['ts', 'table', 'session', 'spin', 'num', 'live', 'acted',
+                            'bet', 'followed_suggestion', 'sug_dozen', 'sug_color',
+                            'regime_kind', 'regime_color', 'run', 'frac_red', 'prep',
+                            'is_win', 'delta', 'cost', 'bank_after', 'spins_since_entry'])
+                for r in log_rows:
+                    sug = r.get('suggested') or {}
+                    reg = r.get('regime') or {}
+                    w.writerow([
+                        r.get('ts', ''), r.get('table', ''), r.get('session', ''),
+                        r.get('spin', ''), r.get('num', ''), r.get('live', ''),
+                        r.get('acted', ''), '|'.join(r.get('bet') or []),
+                        r.get('followed_suggestion', ''), sug.get('dozen', ''),
+                        sug.get('color', ''), reg.get('kind', ''), reg.get('color', ''),
+                        reg.get('run', ''), reg.get('frac_red', ''), reg.get('prep', ''),
+                        r.get('is_win', ''), r.get('delta', ''), r.get('cost', ''),
+                        r.get('bank_after', ''), r.get('spins_since_entry', ''),
+                    ])
+            return path
+        except Exception:
+            return None
+
+    def _roi_bars(self, items):
+        """items: [(label, value_float)] -> a horizontal bar chart Container.
+        Bars grow right (green, +) / left (red, −) from a centre zero line; the
+        numeric value is baked into each label so nothing overflows."""
+        import flet.canvas as cv
+        import inspect
+        _tv = ('value' if 'value' in inspect.signature(cv.Text.__init__).parameters
+               else 'text')
+
+        def _t(x, y, s, color='#dddddd', size=11):
+            return cv.Text(x=x, y=y, style=ft.TextStyle(color=color, size=size),
+                           **{_tv: str(s)})
+
+        items = list(items)
+        row_h, top, label_w = 24, 6, 150
+        H = top * 2 + max(len(items), 1) * row_h
+
+        def build(cw):
+            shapes = []
+            if not items:
+                return shapes
+            bw = max(30, cw - label_w - 6)
+            cx = label_w + bw / 2
+            maxabs = max((abs(v) for _, v in items), default=1) or 1
+            shapes.append(cv.Line(x1=cx, y1=top, x2=cx, y2=top + len(items) * row_h,
+                                  paint=ft.Paint(color='#555555', stroke_width=1)))
+            for i, (label, v) in enumerate(items):
+                cy = top + i * row_h + row_h / 2
+                length = (abs(v) / maxabs) * (bw / 2 - 4)
+                color = '#2ecc71' if v >= 0 else '#e74c3c'
+                rx = cx if v >= 0 else cx - length
+                shapes.append(cv.Rect(x=rx, y=cy - 7, width=max(length, 1), height=14,
+                                      paint=ft.Paint(color=color,
+                                                     style=ft.PaintingStyle.FILL)))
+                shapes.append(_t(2, cy - 7, str(label)[:26]))
+            return shapes
+
+        canvas = cv.Canvas(
+            shapes=[], expand=True, height=H, resize_interval=0,
+            on_resize=lambda e: (setattr(canvas, 'shapes', build(e.width))
+                                 or canvas.update()))
+        return ft.Container(bgcolor='#0d0d0d', border_radius=8, padding=4,
+                            content=canvas, height=H)
+
+    def show_bet_eval_view(self, investment_id: int = None):
+        """AI Bet Eval page — how the player's real entry decisions performed
+        (reads bet_log.jsonl, global across all logged play)."""
+        s = self._compute_bet_eval()
+
+        def go_back(ev):
+            if investment_id is not None:
+                self.show_investment_dashboard(investment_id)
+            else:
+                self.show_main_menu()
+
+        def _apply_cfg(cfg):
+            def h(ev):
+                try:
+                    self._save_rvs_config(cfg)
+                except Exception:
+                    pass
+                self.show_bet_eval_view(investment_id)
+            return h
+
+        def _apply_policy(kinds):
+            def h(ev):
+                try:
+                    self._save_entry_policy(kinds)
+                except Exception:
+                    pass
+                self.show_bet_eval_view(investment_id)
+            return h
+
+        def _clear_policy(ev):
+            try:
+                self._save_entry_policy(None)
+            except Exception:
+                pass
+            self.show_bet_eval_view(investment_id)
+
+        def _export(ev):
+            p = self._export_bet_eval_csv()
+            dlg = ft.AlertDialog(
+                title=ft.Text("Export CSV", color='#3498db',
+                              weight=ft.FontWeight.BOLD),
+                content=ft.Text(f"Saved to:\n{p}" if p else "Export failed.",
+                                color=ft.Colors.WHITE, selectable=True, size=12),
+                modal=True, bgcolor='#1e1e1e')
+            dlg.actions = [ft.ElevatedButton(
+                "OK", on_click=lambda _e: (setattr(dlg, 'open', False), dlg.update()),
+                style=ft.ButtonStyle(bgcolor='#27ae60', color=ft.Colors.WHITE))]
+            self.page.show_dialog(dlg)
+
+        def _stash_clear_memory(ev):
+            confirm_dlg = ft.AlertDialog(modal=True, bgcolor='#1e1e1e')
+
+            def do_clear(ev2):
+                path = self._stash_and_clear_ai_memory()
+                confirm_dlg.open = False
+                confirm_dlg.update()
+                result_dlg = ft.AlertDialog(
+                    title=ft.Text("Stash & Clear Memory",
+                                  color=('#27ae60' if path else '#ff4444'),
+                                  weight=ft.FontWeight.BOLD),
+                    content=ft.Text(
+                        (f"Backed up to:\n{path}\n\nAI memory cleared — "
+                         f"suggestions, RVS tuning, and the entry filter "
+                         f"start learning fresh.") if path else
+                        "Stash failed — nothing was cleared.",
+                        color=ft.Colors.WHITE, selectable=True, size=12),
+                    modal=True, bgcolor='#1e1e1e')
+                result_dlg.actions = [ft.ElevatedButton(
+                    "OK", on_click=lambda _e: (setattr(result_dlg, 'open', False),
+                                               result_dlg.update(),
+                                               self.show_bet_eval_view(investment_id)),
+                    style=ft.ButtonStyle(bgcolor='#27ae60', color=ft.Colors.WHITE))]
+                self.page.show_dialog(result_dlg)
+
+            def cancel(ev2):
+                confirm_dlg.open = False
+                confirm_dlg.update()
+
+            confirm_dlg.title = ft.Text("STASH & CLEAR AI MEMORY",
+                                        color='#ff4444', size=14,
+                                        weight=ft.FontWeight.BOLD)
+            confirm_dlg.content = ft.Text(
+                "Backs up everything the AI has learned (strategy stats, "
+                "decisions, bet log, RVS tuning, entry filter, croupier log) "
+                "to a timestamped folder, then resets it so the AI starts "
+                "learning from zero.\n\nYour sessions, investments, and "
+                "bankroll history are never touched.\n\nBacked up first — "
+                "this can be restored from the stash folder if needed.",
+                color=ft.Colors.WHITE, size=12)
+            confirm_dlg.actions = [
+                ft.ElevatedButton("CANCEL", on_click=cancel, expand=1,
+                    style=ft.ButtonStyle(bgcolor='#555555', color=ft.Colors.WHITE)),
+                ft.ElevatedButton("STASH & CLEAR", on_click=do_clear, expand=1,
+                    style=ft.ButtonStyle(bgcolor='#ff4444', color=ft.Colors.WHITE)),
+            ]
+            confirm_dlg.actions_alignment = ft.MainAxisAlignment.CENTER
+            self.page.show_dialog(confirm_dlg)
+
+        def pct(x):
+            return '--' if x is None else f"{x:.0f}%"
+
+        rows = []
+
+        def hdr(t):
+            rows.append(ft.Text(t, color='#16a085', size=15,
+                                weight=ft.FontWeight.BOLD))
+
+        def line(t, c='#dddddd'):
+            rows.append(ft.Text(t, color=c, size=13))
+
+        if s.get('empty'):
+            line("No bets logged yet.", '#f1c40f')
+            line("Play some sessions — every spin is logged — then reopen this page.")
+        else:
+            hdr("Entry behaviour")
+            line(f"Spins logged: {s['spins']}")
+            line(f"Entered (bet): {s['entered']}   ({s['entry_rate']:.0f}%)")
+            line(f"Passed (no bet): {s['passed']}")
+            line(f"Suggestion shown: {s['sug_shown']}   (entered {s['sug_entered']})")
+            if s['avg_wait'] is not None:
+                line(f"Avg wait before entry: {s['avg_wait']:.1f} spins")
+            rows.append(ft.Divider(color='#333'))
+
+            hdr("Realized results — bets you actually placed")
+            line(f"Entries: {s['entered']}    Win rate: {pct(s['win'])} ({s['graded']} graded)")
+            line(f"Net: {s['net']:+.2f}    Staked: {s['staked']:.2f}")
+            rows.append(ft.Text(
+                f"ROI: {s['roi']:+.2f}%",
+                color=('#2ecc71' if s['roi'] >= 0 else '#ff5555'),
+                size=18, weight=ft.FontWeight.BOLD))
+            rows.append(ft.Divider(color='#333'))
+
+            hdr("By regime (entries only)  — bar = ROI")
+            if not s['regimes']:
+                line("(no entries yet)")
+            else:
+                rows.append(self._roi_bars(
+                    [(f"{rr['kind']} {rr['roi']:+.0f}% ({rr['entries']}b)", rr['roi'])
+                     for rr in s['regimes']]))
+            rows.append(ft.Divider(color='#333'))
+
+            hdr("Following the suggested dozen vs freelancing")
+            fb = [(f"{lbl_} {b['roi']:+.0f}% ({b['entries']}b)", b['roi'])
+                  for lbl_, b in (("Followed", s['followed']),
+                                  ("Freelanced", s['freelanced'])) if b['entries']]
+            if fb:
+                rows.append(self._roi_bars(fb))
+            else:
+                line("(no entries yet)")
+            rows.append(ft.Divider(color='#333'))
+
+            hdr("Suggestion scoreboard — every option (bar = ROI)")
+            _CAT_NAME = {'docs': 'Dozen+col', 'cols': 'Columns',
+                         'secs': 'Sectors', 'thirds': 'Thirds', 'wave': 'Waves'}
+            if not s.get('scoreboard'):
+                line("Needs spins logged with v19.0.1+ (all on-screen "
+                     "suggestions). Play more and reopen.", '#f1c40f')
+            else:
+                rows.append(self._roi_bars(
+                    [(f"{_CAT_NAME.get(sc['cat'], sc['cat'])} {sc['roi']:+.0f}% "
+                      f"({sc['hitrate']:.0f}% hit)", sc['roi'])
+                     for sc in s['scoreboard']]))
+            rows.append(ft.Container(height=6))
+            line("Realized play (what you actually bet), not the every-spin "
+                 "backtest. The scoreboard is counterfactual — how each option "
+                 "type would have paid, following its suggestion.", '#7f8c8d')
+
+        # ── #1 RVS auto-tune (always shown; uses dealer sequences) ───────────
+        rows.append(ft.Divider(color='#16a085'))
+        hdr("Model tuning — RVS (held-out validated)")
+        cand = self._tune_rvs_candidate()
+        if not cand.get('ok'):
+            line(cand.get('reason', '—'), '#f1c40f')
+        else:
+            if not cand.get('confident'):
+                line(f"⏳ WAIT — only {cand['n_test']} held-out dealers, "
+                     f"treat as provisional", '#f1c40f')
+            line(f"Fit on {cand['n_train']} dealers, tested on {cand['n_test']} "
+                 f"held-out.")
+            line(f"Current config held-out ROI: {cand['cur_test_roi']:+.2f}%")
+            cc = '#2ecc71' if cand['improvement'] >= 0 else '#ff5555'
+            rows.append(ft.Text(
+                f"Candidate held-out ROI: {cand['cand_test_roi']:+.2f}%  "
+                f"(Δ {cand['improvement']:+.2f})", color=cc, size=14,
+                weight=ft.FontWeight.BOLD))
+            c = cand['candidate']
+            line(f"cfg: streak≥{c['streak']}  rhythm≤{c['rhythm']}  "
+                 f"ride≥{c['ride_len']}  bias≥{c['bias']}", '#aaaaaa')
+            if cand['improvement'] > 0.5:
+                already = all(RVS_CFG.get(k) == c[k]
+                              for k in ('streak', 'rhythm', 'ride_len', 'bias'))
+                if already:
+                    rows.append(ft.Text("✓ APPLIED", color='#2ecc71', size=14,
+                                        weight=ft.FontWeight.BOLD))
+                else:
+                    rows.append(ft.ElevatedButton(
+                        "APPLY TUNED CONFIG", on_click=_apply_cfg(c), height=42,
+                        style=ft.ButtonStyle(bgcolor='#16a085', color=ft.Colors.WHITE)))
+                line("Beats current on data it wasn't tuned on. Applies on tap only.",
+                     '#7f8c8d')
+            else:
+                line("No candidate beats the current config out-of-sample — "
+                     "keeping current.", '#7f8c8d')
+
+        # ── #2 entry-policy learning (uses the player's real bets) ───────────
+        rows.append(ft.Divider(color='#16a085'))
+        hdr("Entry policy — your winning regimes (held-out validated)")
+        pol = self._learn_entry_policy_candidate()
+        if not pol.get('ok'):
+            line(pol.get('reason', '—'), '#f1c40f')
+        else:
+            if not pol.get('confident'):
+                line(f"⏳ WAIT — only {pol['n_test']} held-out entries, "
+                     f"treat as provisional", '#f1c40f')
+            line(f"Fit on {pol['n_train']} entries, tested on {pol['n_test']} "
+                 f"held-out.  (bar = ROI per regime, train)")
+            rows.append(self._roi_bars(
+                [(f"{k} {rk:+.0f}% ({nk}b)", rk)
+                 for k, (nk, rk) in sorted(pol['train_bykind'].items(),
+                                           key=lambda kv: -kv[1][1])]))
+            line(f"Recommend entering only: "
+                 f"{', '.join(pol['policy']) if pol['policy'] else '(none)'}")
+            cc = '#2ecc71' if pol['improvement'] >= 0 else '#ff5555'
+            rows.append(ft.Text(
+                f"Held-out: all {pol['test_all_roi']:+.1f}%  →  "
+                f"filtered {pol['test_policy_roi']:+.1f}%  (Δ {pol['improvement']:+.1f})",
+                color=cc, size=13))
+            if pol['policy'] and pol['improvement'] > 0.5:
+                already = getattr(self, 'entry_policy', None) == set(pol['policy'])
+                if already:
+                    rows.append(ft.Text("✓ APPLIED", color='#2ecc71', size=14,
+                                        weight=ft.FontWeight.BOLD))
+                else:
+                    rows.append(ft.ElevatedButton(
+                        "APPLY ENTRY FILTER", on_click=_apply_policy(pol['policy']),
+                        height=42,
+                        style=ft.ButtonStyle(bgcolor='#16a085', color=ft.Colors.WHITE)))
+                line("The AI bar will flag ENTER/SKIP by regime. Applies on tap only.",
+                     '#7f8c8d')
+            else:
+                line("Filtering doesn't improve held-out ROI — no filter "
+                     "recommended.", '#7f8c8d')
+        if getattr(self, 'entry_policy', None):
+            rows.append(ft.Row(spacing=8, controls=[
+                ft.Text(f"Active entry filter: {', '.join(sorted(self.entry_policy))}",
+                        color='#f1c40f', size=12, expand=True),
+                ft.ElevatedButton("CLEAR", on_click=_clear_policy, height=34,
+                                  style=ft.ButtonStyle(bgcolor='#7f8c8d',
+                                                       color=ft.Colors.WHITE)),
+            ]))
+
+        self._set_view(
+            ft.Container(
+                bgcolor='#1a1a1a', expand=True,
+                content=ft.Column(expand=True, controls=[
+                    ft.Container(
+                        bgcolor='#2c3e50',
+                        padding=ft.padding.only(left=8, right=8, top=36, bottom=8),
+                        content=ft.Row(controls=[
+                            ft.ElevatedButton(
+                                "BACK", on_click=go_back,
+                                style=ft.ButtonStyle(bgcolor='#34495e',
+                                                     color=ft.Colors.WHITE)),
+                            ft.ElevatedButton(
+                                "⬇ CSV", on_click=_export,
+                                style=ft.ButtonStyle(bgcolor='#16a085',
+                                                     color=ft.Colors.WHITE)),
+                            ft.ElevatedButton(
+                                "🗄 STASH & CLEAR", on_click=_stash_clear_memory,
+                                style=ft.ButtonStyle(bgcolor='#c0392b',
+                                                     color=ft.Colors.WHITE)),
+                            ft.Text("AI BET EVAL",
+                                    color=ft.Colors.WHITE, size=13,
+                                    weight=ft.FontWeight.BOLD, expand=True,
+                                    text_align=ft.TextAlign.RIGHT),
+                        ]),
+                    ),
+                    ft.ListView(controls=rows, expand=True, spacing=6, padding=14),
+                ]),
+            )
+        )
+
     def show_actual_graph_view(self, investment_id: int, inv_name: str,
                                inv_capital: float, inv_type: str = 'FIAT',
                                mesa_usd_rate: dict = None, usd_capital: float = 0.0):
@@ -3210,8 +4267,8 @@ class LinupApp:
 
         # Initial chip denominations: budget-derived, floored to base_chip
         _sug_budget     = sug_bank * sug_max_loss / 100
-        _sug_chip_denom = max(_round_up_chip(_sug_budget / 108), sug_base_chip)
-        sug_fout        = max(_round_up_chip(_sug_budget / 18), sug_base_chip)
+        _sug_chip_denom = max(_round_up_chip(_sug_budget / 270), sug_base_chip)
+        sug_fout        = max(_round_up_chip(_sug_budget / 80), sug_base_chip)
 
         def _f(val):
             try:
@@ -3220,30 +4277,38 @@ class LinupApp:
                 return 0.0
 
         def _chip_label_text_prog(base_chip, bank, max_loss_pct):
-            """CHIP IN label: progression breakdown then percentages."""
+            """CHIP IN label: 4-step recovering ladder (1·2·4·8) then percentages.
+            Multipliers double so every step, when it wins, recovers all prior
+            losses and still nets a base unit — matches _progression_for_N(18)."""
             try:
                 b = _f(base_chip)
                 total_1x = b * 18 * 1
                 total_2x = b * 18 * 2
-                total_3x = b * 18 * 3
-                total    = total_1x + total_2x + total_3x
+                total_4x = b * 18 * 4
+                total_8x = b * 18 * 8
+                total    = total_1x + total_2x + total_4x + total_8x
                 pct_bank = (total / bank * 100) if bank > 0 else 0
                 pct_cap  = (total / capital * 100) if capital > 0 else 0
-                return (f"1x({total_1x:.2f}) + 2x({total_2x:.2f}) + 3x({total_3x:.2f})"
+                return (f"1x({total_1x:.2f}) + 2x({total_2x:.2f}) + 4x({total_4x:.2f})"
+                        f" + 8x({total_8x:.2f})"
                         f" = {_amt(total)} · {pct_bank:.1f}% bank · {pct_cap:.1f}% capital")
             except Exception:
                 return ""
 
         def _chip_label_text(chip_val, bank, max_loss_pct):
-            """CHIP OUT label: 2 chips at 1x·3x·5x breakdown then percentages."""
+            """CHIP OUT label: 2 groups on a 4-step recovering ladder (1·3·9·27)
+            then percentages. Multipliers triple so each winning step recovers
+            all prior losses — matches PROG_2_OUT = 2×[1,3,9,27]."""
             try:
-                total_1x = chip_val * 2 * 1
-                total_3x = chip_val * 2 * 3
-                total_5x = chip_val * 2 * 5
-                total    = total_1x + total_3x + total_5x   # chip_val × 18
+                total_1x  = chip_val * 2 * 1
+                total_3x  = chip_val * 2 * 3
+                total_9x  = chip_val * 2 * 9
+                total_27x = chip_val * 2 * 27
+                total    = total_1x + total_3x + total_9x + total_27x  # chip × 80
                 pct_bank = (total / bank * 100) if bank > 0 else 0
                 pct_cap  = (total / capital * 100) if capital > 0 else 0
-                return (f"1x({total_1x:.2f}) + 3x({total_3x:.2f}) + 5x({total_5x:.2f})"
+                return (f"1x({total_1x:.2f}) + 3x({total_3x:.2f}) + 9x({total_9x:.2f})"
+                        f" + 27x({total_27x:.2f})"
                         f" = {_amt(total)} · {pct_bank:.1f}% bank · {pct_cap:.1f}% capital")
             except Exception:
                 return ""
@@ -3295,7 +4360,8 @@ class LinupApp:
             return str(int(v)) if v == int(v) else f"{v:g}"
 
         # The four fields share one MAX-LOSS budget: B = bank * maxloss/100.
-        # CHIP IN total = chip × 90, CHIP OUT total = chip × 18 — each equal to B.
+        # CHIP IN total = chip × 270 (18 nums × [1+2+4+8]), CHIP OUT total =
+        # chip × 80 (2 groups × [1+3+9+27]) — each equal to B.
         # Editing any field re-derives the others; chips stay multiples of the
         # base chip and are floored so the budget never exceeds MAX LOSS.
         def _recalc_fin(e=None):
@@ -3309,8 +4375,8 @@ class LinupApp:
                 ml   = _f(self.max_loss_input.value)
                 budget = bk * max(ml, 0) / 100
                 if bk > 0 and budget > 0:
-                    cin  = _snap_to_base(budget / 108, base)  # CHIP IN: 108 chips
-                    cout = _snap_to_base(budget / 18, base)   # CHIP OUT: 18 chips
+                    cin  = _snap_to_base(budget / 270, base)  # CHIP IN: 270 chips
+                    cout = _snap_to_base(budget / 80, base)   # CHIP OUT: 80 chips
                 else:
                     cin = cout = max(base, 0.0)
                 self.fin_input.value  = _fmt(cin)
@@ -3326,13 +4392,13 @@ class LinupApp:
         def _sync_from_chip(chip_val, chips_per_total):
             """A chip was edited → back-solve the shared budget, push the implied
             MAX LOSS %, and return the re-derived chips. chips_per_total is
-            108 (CHIP IN) or 18 (CHIP OUT)."""
+            270 (CHIP IN) or 80 (CHIP OUT)."""
             bk   = _f(self.banca_input.value)
             base = _f(self.fin_base_input.value)
             budget = max(chip_val, 0.0) * chips_per_total
             ml   = (budget / bk * 100) if bk > 0 else 0.0
-            cin  = _snap_to_base(budget / 108, base) if budget > 0 else max(base, 0.0)
-            cout = _snap_to_base(budget / 18, base) if budget > 0 else max(base, 0.0)
+            cin  = _snap_to_base(budget / 270, base) if budget > 0 else max(base, 0.0)
+            cout = _snap_to_base(budget / 80, base) if budget > 0 else max(base, 0.0)
             self.max_loss_input.value = _fmt_pct(ml)
             self.max_loss_input.update()
             return bk, cin, cout
@@ -3343,7 +4409,7 @@ class LinupApp:
                 return
             _busy[0] = True
             try:
-                bk, _cin, cout = _sync_from_chip(_f(self.fin_input.value), 108)
+                bk, _cin, cout = _sync_from_chip(_f(self.fin_input.value), 270)
                 self.fout_input.value = _fmt(cout)
                 self.fout_input.update()
                 _refresh_labels(bk, _f(self.fin_input.value), cout)
@@ -3358,7 +4424,7 @@ class LinupApp:
                 return
             _busy[0] = True
             try:
-                bk, cin, _cout = _sync_from_chip(_f(self.fout_input.value), 18)
+                bk, cin, _cout = _sync_from_chip(_f(self.fout_input.value), 80)
                 self.fin_input.value = _fmt(cin)
                 self.fin_input.update()
                 _refresh_labels(bk, cin, _f(self.fout_input.value))
@@ -3474,6 +4540,13 @@ class LinupApp:
             if on and hasattr(self, 'cb_basic'):
                 self.cb_basic.value = True
                 self.cb_basic.update()
+            if on and getattr(self, 'live_sessions_mode', False):
+                self.live_sessions_mode = False
+                _ls_lbl.value    = "LIVE SESSIONS: OFF"
+                _ls_ref[0].style = ft.ButtonStyle(bgcolor='#555555',
+                                                  color=ft.Colors.WHITE)
+                _ls_lbl.update()
+                _ls_ref[0].update()
             _lt_lbl.update()
             _lt_ref[0].update()
 
@@ -3484,6 +4557,38 @@ class LinupApp:
             on_click=_toggle_live_table,
         )
         _lt_ref[0] = live_table_btn
+
+        self.live_sessions_mode = False
+        _ls_lbl = ft.Text("LIVE SESSIONS: OFF", color=ft.Colors.WHITE,
+                          weight=ft.FontWeight.BOLD)
+        _ls_ref = [None]
+
+        def _toggle_live_sessions(e):
+            self.live_sessions_mode = not self.live_sessions_mode
+            on = self.live_sessions_mode
+            _ls_lbl.value    = "LIVE SESSIONS: ON" if on else "LIVE SESSIONS: OFF"
+            _ls_ref[0].style = ft.ButtonStyle(
+                bgcolor='#8e44ad' if on else '#555555',
+                color=ft.Colors.WHITE,
+            )
+            if on and self.live_table_mode:
+                # Live Sessions runs on the Live Table = OFF setup.
+                self.live_table_mode = False
+                _lt_lbl.value    = "LIVE TABLE: OFF"
+                _lt_ref[0].style = ft.ButtonStyle(bgcolor='#555555',
+                                                  color=ft.Colors.WHITE)
+                _lt_lbl.update()
+                _lt_ref[0].update()
+            _ls_lbl.update()
+            _ls_ref[0].update()
+
+        live_sessions_btn = ft.ElevatedButton(
+            content=_ls_lbl,
+            height=50, expand=True,
+            style=ft.ButtonStyle(bgcolor='#555555', color=ft.Colors.WHITE),
+            on_click=_toggle_live_sessions,
+        )
+        _ls_ref[0] = live_sessions_btn
 
         vc = self.visible_cats
         self.cb_basic  = ft.Checkbox(label="Basic  (R N P I B A)", value=vc['basic'],
@@ -3534,11 +4639,11 @@ class LinupApp:
                         self.fin_base_input,
                         self.max_loss_label,
                         self.max_loss_input,
-                        ft.Text("CHIP IN — investment of 18 chips (1x · 2x · 3x)", color='#27ae60', size=12,
+                        ft.Text("CHIP IN — investment of 18 chips (1x · 2x · 4x · 8x)", color='#27ae60', size=12,
                                 weight=ft.FontWeight.BOLD),
                         self.fin_label,
                         self.fin_input,
-                        ft.Text("CHIP OUT — 2 chips · progression (1x · 3x · 5x)", color='#f1c40f', size=12,
+                        ft.Text("CHIP OUT — 2 chips · progression (1x · 3x · 9x · 27x)", color='#f1c40f', size=12,
                                 weight=ft.FontWeight.BOLD),
                         self.fout_label,
                         self.fout_input,
@@ -3546,6 +4651,8 @@ class LinupApp:
                         free_spin_btn,
                         ft.Container(height=6),
                         live_table_btn,
+                        ft.Container(height=6),
+                        live_sessions_btn,
                         ft.Container(height=10),
                         ft.Text("TABLE COLUMNS:", color='#7f8c8d', size=12,
                                 weight=ft.FontWeight.BOLD),
@@ -3572,6 +4679,12 @@ class LinupApp:
     # ──────────────────────────────────────────────────────────────────
     def iniciar_ciclo(self, e=None):
         try:
+            # Fresh id for THIS play session so the bet log can separate sessions
+            # (session_id is only assigned later, when the session is saved).
+            try:
+                self.play_session_id = datetime.now().strftime('%Y%m%d-%H%M%S')
+            except Exception:
+                self.play_session_id = str(len(getattr(self, 'history_nums', [])))
             self.nombre_mesa   = str(self.table_input.value).upper() or "TABLE 1"
             self.banca_inicial = float(self.banca_input.value or 100)
             self.banca_actual  = self.banca_inicial
@@ -3741,6 +4854,28 @@ class LinupApp:
     # ─────────────────────────────────────────────────────────────────
     # FINALIZE SESSION
     # ─────────────────────────────────────────────────────────────────
+    def _log_draw_sequence(self) -> bool:
+        """Append this session's raw draw sequence to croupier_log.txt (next to
+        the DB), in the '@ dealer' format used by croupier_data.txt, so every
+        session we play is captured for the rhythm/pattern dataset.
+        Best-effort — never blocks finishing a session."""
+        try:
+            nums = getattr(self, 'history_nums', [])
+            if not self.db_path or len(nums) < 10:
+                return False
+            log_path = os.path.join(os.path.dirname(self.db_path), "croupier_log.txt")
+            label = (str(self.nombre_mesa).strip() or "session")
+            try:
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                stamp = ""
+            line = " ".join(str(int(n)) for n in nums)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n@ {label} {stamp}\n{line}\n")
+            return True
+        except Exception:
+            return False
+
     def finalizar_sesion(self, e=None):
         profit   = round(self.banca_actual - self.banca_inicial, 2)
         pl_pct   = (profit / self.banca_inicial * 100) if self.banca_inicial != 0 else 0
@@ -3750,6 +4885,7 @@ class LinupApp:
 
         ok, err_msg    = self._guardar_sesion()
         self._update_table_stats(profit >= 0)
+        draws_logged   = self._log_draw_sequence()
         guardado_txt   = "Saved to history" if ok else f"Error: {err_msg}"
         guardado_color = '#2ecc71' if ok else '#ff4444'
 
@@ -3787,6 +4923,9 @@ class LinupApp:
                 ),
                 ft.Container(height=10),
                 ft.Text(guardado_txt, color=guardado_color, size=13),
+                ft.Text(f"{len(self.history_nums)} draws logged for AI dataset"
+                        if draws_logged else "",
+                        color='#9b59b6', size=11),
             ],
         )
         dlg.actions = [
@@ -3853,6 +4992,26 @@ class LinupApp:
         stats_bar = ft.Container(
             bgcolor='#1e1e1e', padding=5,
             content=ft.Row(controls=[self.lbl_bank, self.lbl_inv, self.lbl_pl]),
+        )
+
+        # ── AI combination-coach + TUNE hit-rate bar ──────────────────────
+        self.lbl_ai_info = ft.Text(
+            self._get_ai_info_display(),
+            color='#f1c40f', weight=ft.FontWeight.BOLD, size=13,
+            text_align=ft.TextAlign.CENTER, no_wrap=True,
+            overflow=ft.TextOverflow.ELLIPSIS, max_lines=1,
+        )
+        self.lbl_tune_info = ft.Text(
+            self._get_tune_info_display(),
+            color='#bb8fce', weight=ft.FontWeight.BOLD, size=12,
+            text_align=ft.TextAlign.CENTER, no_wrap=True,
+            overflow=ft.TextOverflow.ELLIPSIS, max_lines=1,
+        )
+        coach_rows = ([self.lbl_ai_info] if getattr(self, 'ai_ok', False) else []) \
+                     + [self.lbl_tune_info]
+        ai_bar = ft.Container(
+            bgcolor='#2a2a3e', padding=4,
+            content=ft.Column(controls=coach_rows, spacing=2, tight=True),
         )
 
         # ── Progression ON/OFF + fixed multiplier bar ─────────────────────
@@ -4003,9 +5162,14 @@ class LinupApp:
                         updated.append(g)
                 self.grupos_activos = updated
                 for opt, btn in _all_filter_btns:
+                    # R/B are fixed-size circles — keep that shape through
+                    # every restyle, same as the main mixer filter row.
+                    shape_kwargs = ({'shape': ft.CircleBorder(), 'padding': 0}
+                                     if opt in ('R', 'B') else {})
                     btn.style = ft.ButtonStyle(
                         bgcolor=_ACTIVE_COLOR[opt] if opt == new_f else _INACTIVE,
                         color=ft.Colors.WHITE,
+                        **shape_kwargs,
                     )
                     btn.update()
                 self._refresh_mixer_colors()
@@ -4014,25 +5178,36 @@ class LinupApp:
                     self.lbl_inv.update()
                 self.actualizar_sugerencias()
 
-            def _filter_btn(opt, label, height=34, size=11):
+            def _filter_btn(opt, label, height=34, size=11, circle=False, expand=7):
                 def _click(e, o=opt):
                     _apply_filter(None if self.live_filter == o else o)
-                btn = ft.ElevatedButton(
-                    content=self._txt(label, size=size),
-                    expand=True, height=height,
-                    style=ft.ButtonStyle(bgcolor=_INACTIVE, color=ft.Colors.WHITE),
-                    on_click=_click,
-                )
+                if circle:
+                    # R/B as a fixed-size circle with the letter centered,
+                    # same as the main mixer filter row.
+                    btn = ft.ElevatedButton(
+                        content=self._txt(label, size=size),
+                        width=height, height=height,
+                        style=ft.ButtonStyle(bgcolor=_INACTIVE, color=ft.Colors.WHITE,
+                                             shape=ft.CircleBorder(), padding=0),
+                        on_click=_click,
+                    )
+                else:
+                    btn = ft.ElevatedButton(
+                        content=self._txt(label, size=size),
+                        expand=expand, height=height,
+                        style=ft.ButtonStyle(bgcolor=_INACTIVE, color=ft.Colors.WHITE),
+                        on_click=_click,
+                    )
                 _all_filter_btns.append((opt, btn))
                 return btn
 
             row2 = ft.Row(controls=[
-                _filter_btn('1-18',  '1-18',  height=28, size=9),
-                _filter_btn('Even',  'Even',  height=28, size=9),
-                _filter_btn('R',     'RED',   height=28, size=9),
-                _filter_btn('B',     'BLACK', height=28, size=9),
-                _filter_btn('Odd',   'Odd',   height=28, size=9),
-                _filter_btn('19-36', '19-36', height=28, size=9),
+                _filter_btn('1-18',  '1-18',  height=28, size=9, expand=8),
+                _filter_btn('Even',  'Even',  height=28, size=9, expand=7),
+                _filter_btn('R',     'R',     height=28, size=11, circle=True),
+                _filter_btn('B',     'B',     height=28, size=11, circle=True),
+                _filter_btn('Odd',   'Odd',   height=28, size=9, expand=7),
+                _filter_btn('19-36', '19-36', height=28, size=9, expand=8),
             ], spacing=2, tight=True)
             rb_bar = ft.Container(
                 bgcolor='#1a2a3a',
@@ -4096,17 +5271,36 @@ class LinupApp:
                     ft.ControlState.PRESSED: ft.Colors.with_opacity(0.7, '#000000') if g == 'B'
                                             else ft.Colors.with_opacity(0.4, ft.Colors.WHITE),
                 }
-                btn = ft.ElevatedButton(
-                    content=self._txt(g, size=text_size),
-                    data={'name': g, 'color': btn_color},
-                    on_click=self.seleccionar_mixer,
-                    expand=True, height=40,
-                    style=ft.ButtonStyle(
-                        bgcolor=btn_color, color=ft.Colors.WHITE,
-                        animation_duration=400,
-                        overlay_color=overlay,
-                    ),
-                )
+                if g in ('R', 'B'):
+                    # Red/Black as fixed-size circles (letter centered inside),
+                    # like the felt layout — not flexed with the other labels.
+                    btn = ft.ElevatedButton(
+                        content=self._txt(g, size=text_size),
+                        data={'name': g, 'color': btn_color},
+                        on_click=self.seleccionar_mixer,
+                        width=40, height=40,
+                        style=ft.ButtonStyle(
+                            bgcolor=btn_color, color=ft.Colors.WHITE,
+                            animation_duration=400,
+                            overlay_color=overlay,
+                            shape=ft.CircleBorder(),
+                            padding=0,
+                        ),
+                    )
+                else:
+                    # High/Low (1-18, 19-36) a bit bigger than Even/Odd.
+                    btn_expand = 8 if g in ('1-18', '19-36') else 7
+                    btn = ft.ElevatedButton(
+                        content=self._txt(g, size=text_size),
+                        data={'name': g, 'color': btn_color},
+                        on_click=self.seleccionar_mixer,
+                        expand=btn_expand, height=40,
+                        style=ft.ButtonStyle(
+                            bgcolor=btn_color, color=ft.Colors.WHITE,
+                            animation_duration=400,
+                            overlay_color=overlay,
+                        ),
+                    )
                 self.mixer_btns[g] = btn
                 filter_row_btns.append(btn)
             mixer_rows.append(ft.Row(controls=filter_row_btns, spacing=2))
@@ -4116,30 +5310,45 @@ class LinupApp:
             content=ft.Column(controls=mixer_rows, spacing=2),
         )
 
+        def _ctrl_btn_txt(label, size=11):
+            # Sized per-button to fit its word without clipping; wraps
+            # (rather than clips) a two-word label onto a second line.
+            return ft.Text(
+                label, size=size, weight=ft.FontWeight.BOLD,
+                text_align=ft.TextAlign.CENTER, no_wrap=False, max_lines=2,
+            )
+
         self.btn_inv = ft.ElevatedButton(
-            content=self._txt("INVEST"),
+            content=_ctrl_btn_txt("INVEST", size=11),
             on_click=self.confirmar_manual,
-            expand=2, height=45,
+            expand=8, height=50,
             style=ft.ButtonStyle(bgcolor='#2ecc71', color=ft.Colors.WHITE,
                                  animation_duration=400),
         )
+        self.btn_tune = ft.ElevatedButton(
+            content=_ctrl_btn_txt("TUNE", size=11),
+            on_click=self.confirmar_tune,
+            expand=5, height=50,
+            style=ft.ButtonStyle(bgcolor='#8e44ad', color=ft.Colors.WHITE,
+                                 animation_duration=400),
+        )
         btn_corr = ft.ElevatedButton(
-            content=self._txt("UNDO"),
+            content=_ctrl_btn_txt("UNDO", size=11),
             on_click=self.corregir_ultimo,
-            expand=1, height=45,
+            expand=5, height=50,
             style=ft.ButtonStyle(bgcolor='#f39c12', color=ft.Colors.WHITE,
                                  animation_duration=400),
         )
         btn_fin = ft.ElevatedButton(
-            content=self._txt("FINISH"),
+            content=_ctrl_btn_txt("FINISH", size=11),
             on_click=self.finalizar_sesion,
-            expand=1, height=45,
+            expand=5, height=50,
             style=ft.ButtonStyle(bgcolor='#ff4444', color=ft.Colors.WHITE,
                                  animation_duration=400),
         )
         ctrl_bar = ft.Container(
             padding=ft.padding.symmetric(horizontal=4, vertical=4),
-            content=ft.Row(controls=[self.btn_inv, btn_corr, btn_fin], spacing=4),
+            content=ft.Row(controls=[self.btn_inv, self.btn_tune, btn_corr, btn_fin], spacing=4),
         )
 
         teclado_controls = [
@@ -4189,7 +5398,7 @@ class LinupApp:
         self._rebuild_table_header()
 
         bitacora = ft.Container(
-            height=170, bgcolor='#0d0d0d',
+            height=300, bgcolor='#0d0d0d',
             content=ft.Column(
                 spacing=0,
                 controls=[
@@ -4208,7 +5417,9 @@ class LinupApp:
                 content=ft.Column(
                     expand=True, spacing=0,
                     controls=inv_bar_controls + [
-                        stats_bar, prog_bar, sug_bar,
+                        stats_bar,
+                    ] + ([ai_bar] if ai_bar else []) + [
+                        prog_bar, sug_bar,
                     ] + ([rb_bar] if rb_bar else []) + [
                         mixer_box, ctrl_bar,
                         ft.Container(
@@ -4245,7 +5456,7 @@ class LinupApp:
         self.reg_header_row.controls = [
             ft.Text(h, width=cw, color=c,
                     text_align=ft.TextAlign.CENTER,
-                    size=7, weight=ft.FontWeight.BOLD)
+                    size=9, weight=ft.FontWeight.BOLD)
             for h, c in specs
         ]
 
@@ -4258,7 +5469,7 @@ class LinupApp:
         vc = getattr(self, 'visible_cats', {k: True for k in ['basic','cols','docs','secs','thirds','wave']})
         s  = "■"
         W  = ft.Colors.WHITE
-        for n in self.history_nums[-9:]:
+        for n in self.history_nums[-18:]:
             cells = [(str(n), '#f1c40f')]
             if vc.get('basic', True):
                 cells += [
@@ -4288,7 +5499,7 @@ class LinupApp:
                     controls=[
                         ft.Text(txt, width=cw, color=col,
                                 text_align=ft.TextAlign.CENTER,
-                                size=8, weight=ft.FontWeight.BOLD)
+                                size=10, weight=ft.FontWeight.BOLD)
                         for txt, col in cells
                     ],
                     spacing=0,
@@ -4364,9 +5575,19 @@ class LinupApp:
         # Simple outside: only ONE type, and max 2 groups of that type
         return types_used == 1 and n <= 2
 
+    def _grupo_set(self, g):
+        """Numbers covered by group g for bet cost / win-check — swaps in the
+        wheel-neighbour-widened Z0/ZG/ZP/H (e.g. ZP protections 1 & 6) when
+        Live Sessions OR Live Table mode is on."""
+        live = (getattr(self, 'live_sessions_mode', False)
+                or getattr(self, 'live_table_mode', False))
+        if live and g in GRUPOS_SECTOR_LS:
+            return GRUPOS_SECTOR_LS[g]
+        return GRUPOS_MAESTROS.get(g, set())
+
     def _group_cost(self, g):
         if g in self.GRUPOS_STRAIGHT or g in GRUPOS_LIVE_INSIDE:
-            return self.val_fin * len(GRUPOS_MAESTROS[g])
+            return self.val_fin * len(self._grupo_set(g))
         return self.val_fout
 
     def _progression_for_N(self, N: int) -> list:
@@ -4462,8 +5683,8 @@ class LinupApp:
             multi_in = self._current_multi(is_out=False)
 
             if self.sniper_mode:
-                intersection = self._compute_intersection()
-                num_chips = len(intersection) if intersection else 1
+                intersection, weights = self._compute_intersection(with_weights=True)
+                num_chips = sum(weights.values()) if weights else 1
                 if self.prog_on:
                     multi_in = self._sniper_inside_multi(num_chips)
                 total = self.val_fin * num_chips * multi_in
@@ -4487,6 +5708,11 @@ class LinupApp:
                 pass
 
             num = int(e.control.data)
+            _acted, _bet_groups, _is_win, _cost = False, [], None, 0.0
+            _wait_snapshot = self.spins_since_entry   # captured before any
+                                                       # reset below so the log
+                                                       # reflects the real wait
+            self.last_was_tune = False   # only the TUNE branch below sets this
             if self.activa:
                 n                     = len(self.grupos_activos)
                 is_simple_outside     = self._is_simple_outside_bet()
@@ -4497,13 +5723,20 @@ class LinupApp:
 
                 # Sniper mode: check intersection only; regular mode: check if in any group
                 is_win = False
+                chip_weight = 1   # how many stacked chips actually sit on `num`
                 if self.sniper_mode and not is_simple_outside:
-                    intersection = self._compute_intersection()
+                    intersection, weights = self._compute_intersection(with_weights=True)
                     is_win = num in intersection
+                    chip_weight = weights.get(num, 1)
                 else:
-                    is_win = any(num in GRUPOS_MAESTROS[g] for g in self.grupos_activos)
+                    is_win = any(num in self._grupo_set(g) for g in self.grupos_activos)
+                    if is_win and not is_simple_outside:
+                        chip_weight = self._compute_safety_levels().get(num, 1)
 
                 if is_win:
+                    win_py = win_py * chip_weight   # pay for every stacked chip on `num`,
+                                                     # not just one (overlapping zones — e.g.
+                                                     # Live Sessions ZP+H sharing a number)
                     self.banca_actual += win_py
                     self.last_bank_delta = win_py - total_cost
                     # Only reset progression counters when progression is active
@@ -4530,11 +5763,70 @@ class LinupApp:
                                 self.nivel_martingala_out += 1
                             else:
                                 self.nivel_martingala_in += 1
+                _acted, _bet_groups, _is_win, _cost = (
+                    True, list(self.grupos_activos), is_win, total_cost)
                 self.activa         = False
                 self.grupos_activos = []
                 self.limpiar_seleccion_visual()
+
+                # AI: grade the captured choice now that the result is known,
+                # and incrementally train the combination-choice model.
+                if getattr(self, 'ai_ok', False) and self.current_choice:
+                    try:
+                        self.strategy_model.record_outcome(
+                            self.current_choice, won=is_win,
+                            profit=self.last_bank_delta)
+                        # This board was a line-up the player ENTERED on.
+                        self.strategy_model.record_observation(
+                            self.history_nums, acted=True)
+                        # Learn how long the player waited before this entry.
+                        self.strategy_model.record_entry_wait(self.spins_since_entry)
+                        self.spins_since_entry = 0
+                        if getattr(self, 'decision_tracker', None) and self.current_decision_id:
+                            self.decision_tracker.record_outcome(
+                                decision_id=self.current_decision_id,
+                                spin_result=num,
+                                outcome='win' if is_win else 'loss',
+                                profit_loss=self.last_bank_delta)
+                    except Exception:
+                        pass
+                    finally:
+                        self.current_choice = None
+                        self.current_decision_id = None
+            elif self.tune_activa:
+                # TUNE: same hit/miss check as a real bet, no bank/progression
+                # impact — just scored into tune_hits/tune_total.
+                is_simple_outside = self._is_simple_outside_bet()
+                if self.sniper_mode and not is_simple_outside:
+                    intersection, _ = self._compute_intersection(with_weights=True)
+                    is_win = num in intersection
+                else:
+                    is_win = any(num in self._grupo_set(g) for g in self.grupos_activos)
+
+                self.tune_total    += 1
+                if is_win:
+                    self.tune_hits += 1
+                self.last_was_tune  = True
+                self.last_tune_hit  = is_win
+                self.last_bank_delta  = 0.0
+                self.last_bet_outside = None
+                self._refresh_tune_label()
+
+                # Deliberately NOT logged via _log_real_bet / strategy_model —
+                # a practice pick is neither a real entry nor a real pass, and
+                # shouldn't skew either dataset. _acted stays False below.
+                self.tune_activa    = False
+                self.grupos_activos = []
+                self.limpiar_seleccion_visual()
             else:
-                if self.free_spin_mode:
+                live_mode = (getattr(self, 'live_table_mode', False)
+                             or getattr(self, 'live_sessions_mode', False))
+                if live_mode and num == 0:
+                    # Live Table/Live Sessions: no real chips are down on
+                    # this background R/B tracker, so 0 shouldn't discount
+                    # the bank — still tracked (history/stats), just no P/L.
+                    delta = 0.0
+                elif self.free_spin_mode:
                     # Red + Black uses the BASE chip (not CHIP IN): net 0 unless
                     # 0 falls, in which case both chips are lost.
                     base_chip = getattr(self, 'last_base_chip', self.val_fin)
@@ -4545,8 +5837,40 @@ class LinupApp:
                 self.last_bank_delta    = delta
                 self.last_bet_outside   = None
 
+                # AI: no combo bet — the player is WAITING (lining up) for a
+                # better entry. Record this board as a skipped setup.
+                if getattr(self, 'ai_ok', False):
+                    try:
+                        self.strategy_model.record_observation(
+                            self.history_nums, acted=False)
+                    except Exception:
+                        pass
+
+            # Real-bet logging: record the AI suggestion the player saw, their
+            # actual entry decision (enter/pass), and the outcome — the dataset
+            # for learning WHEN the player enters. Uses history BEFORE this spin
+            # is appended, matching what was on screen at decision time.
+            try:
+                self._log_real_bet(num, _acted, _bet_groups, _is_win, _cost,
+                                   _wait_snapshot)
+            except Exception:
+                pass
+
             self.history_nums.append(num)
             self.sliding_window.append(num)
+            if getattr(self, 'ai_ok', False):
+                self.spins_since_entry += 1   # one more spin in the line-up
+                # Feed the live B/R predictors (green/0 is skipped inside each).
+                if getattr(self, 'rhythm_model', None):
+                    try:
+                        self.rhythm_model.observe_num(num)
+                    except Exception:
+                        pass
+                if getattr(self, 'pattern_model', None):
+                    try:
+                        self.pattern_model.observe_num(num)
+                    except Exception:
+                        pass
             self.update_registration_table()   # buffers row/header updates
             self.actualizar_sugerencias()       # buffers sug_row update
             self.update_ui()                    # single page.update() flushes all
@@ -4555,6 +5879,117 @@ class LinupApp:
             with open("/tmp/linup_error.log", "a") as _f:
                 _f.write(f"[process_number] {type(_err).__name__}: {_err}\n")
                 traceback.print_exc(file=_f)
+
+    def _current_suggestion(self):
+        """The live dozen+colour the app is suggesting right now, as (dozen,
+        colour) — reproduces what the player sees before entering. Uses the
+        pre-spin sliding window (sector affinity) + the RVS colour regime."""
+        try:
+            sw = list(self.sliding_window)
+            if len(sw) < 6:
+                return (None, None)
+            def _sc(g):
+                return sum(DOZEN_SECTOR_AFFINITY[g].get(SECTOR_OF.get(n), 0.0)
+                           for n in sw) / 6.0
+            stats = sorted(((_sc(g), g) for g in ('1a', '2a', '3a')), reverse=True)
+            if stats[0][0] <= 0 or abs(stats[0][0] - stats[1][0]) < 1e-9:
+                return (None, None)   # no data / WAIT tie
+            return (stats[0][1], regime_color(self.history_nums))
+        except Exception:
+            return (None, None)
+
+    def _all_suggestions(self) -> dict:
+        """Reproduce the suggestion shown for EVERY category this spin, as
+        {category: [group_keys]} (the groups a tap would bet). [] = no
+        suggestion / WAIT. Mirrors actualizar_sugerencias; used for the bet-eval
+        scoreboard so we can score every option, not just the one played."""
+        out = {}
+        try:
+            sw = list(self.sliding_window)
+            if len(sw) < 6:
+                return out
+            live = getattr(self, 'live_table_mode', False)
+            lf = getattr(self, 'live_filter', None)
+            cats = [('cols', ['34', '35', '36']), ('docs', ['1a', '2a', '3a']),
+                    ('secs', ['Z0', 'ZG', 'ZP', 'H']), ('thirds', ['T1', 'T2', 'T3']),
+                    ('wave', ['W1', 'W2', 'W3'])]
+            PAIR_BLOQUEADO = {'ZG', 'ZP'}
+            for key, grupos in cats:
+                def _score(g, _key=key):
+                    if live and _key == 'docs':
+                        return sum(DOZEN_SECTOR_AFFINITY[g].get(SECTOR_OF.get(n), 0.0)
+                                   for n in sw) / 6
+                    return sum(1 for n in sw if n in GRUPOS_MAESTROS[g]) / 6
+                stats = sorted(({'g': g, 'p': _score(g)} for g in grupos),
+                               key=lambda x: x['p'], reverse=True)
+                if live and key == 'docs':
+                    tie = (len(stats) > 1 and stats[0]['p'] > 0
+                           and abs(stats[0]['p'] - stats[1]['p']) < 1e-9)
+                    if tie or stats[0]['p'] <= 0:
+                        out[key] = []
+                    else:
+                        top = stats[0]['g']
+                        rcol = regime_color(self.history_nums) if (
+                            lf is None and getattr(self, 'ai_ok', False)) else None
+                        eff = lf if lf is not None else rcol
+                        out[key] = [f'{top}{_DOC_SFX.get(eff, "_L")}']
+                    continue
+                cand = {stats[0]['g'], stats[1]['g']}
+                if (stats[1]['p'] > stats[2 if len(stats) > 2 else 1]['p']
+                        and cand != PAIR_BLOQUEADO):
+                    out[key] = [stats[0]['g'], stats[1]['g']]
+                else:
+                    out[key] = []
+        except Exception:
+            pass
+        return out
+
+    def _log_real_bet(self, num, acted, bet_groups, is_win, cost, wait_before=None):
+        """Append one per-spin JSONL record: the AI suggestion, the player's
+        entry decision, and the outcome. Best-effort; never blocks a spin."""
+        if not getattr(self, 'db_path', None):
+            return
+        import json
+        hist = list(self.history_nums)      # BEFORE this spin is appended
+        pred, kind, d = _regime(hist)
+        sug_dozen, sug_color = self._current_suggestion()
+        sug_combo = f'{sug_dozen}{_DOC_SFX.get(sug_color, "_L")}' if sug_dozen else None
+        disp = [self._to_display_name(g) for g in bet_groups]
+        try:
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            ts = ''
+        rec = {
+            'ts': ts,
+            'table': str(getattr(self, 'nombre_mesa', '')),
+            'session': (getattr(self, 'play_session_id', None)
+                        or getattr(self, 'session_id', None)),
+            'spin': len(hist),
+            'num': int(num),
+            'live': bool(getattr(self, 'live_table_mode', False)),
+            'acted': bool(acted),
+            'bet': disp,
+            'followed_suggestion': bool(sug_dozen and sug_dozen in disp),
+            'suggested': {'dozen': sug_dozen, 'color': sug_color, 'combo': sug_combo},
+            'suggestions': self._all_suggestions(),
+            'regime': {
+                'kind': kind,
+                'color': 'R' if pred == 1 else ('B' if pred == 0 else None),
+                'run': d.get('run'),
+                'frac_red': round(d['frac'], 3) if d.get('frac') is not None else None,
+                'prep': round(d['prep'], 3) if d.get('prep') is not None else None,
+                'n': d.get('n'),
+            },
+            'is_win': is_win,
+            'delta': round(float(getattr(self, 'last_bank_delta', 0.0)), 3),
+            'cost': round(float(cost), 3),
+            'bank_after': round(float(getattr(self, 'banca_actual', 0.0)), 2),
+            'spins_since_entry': (wait_before if wait_before is not None
+                                  else getattr(self, 'spins_since_entry', None)),
+        }
+        path = os.path.join(os.path.dirname(self.db_path), 'bet_log.jsonl')
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec) + '\n')
 
     @staticmethod
     def _to_display_name(g):
@@ -4573,7 +6008,11 @@ class LinupApp:
         for g, btn in self.mixer_btns.items():
             base_color = btn.data['color']
             is_outside = g in outside_groups
-            
+            # R/B are fixed-size circles — keep that shape through every
+            # restyle, otherwise they snap back to a rectangle (and look
+            # like they've shifted) the moment any mixer button is pressed.
+            shape_kwargs = {'shape': ft.CircleBorder(), 'padding': 0} if g in ('R', 'B') else {}
+
             if g in active_display:
                 if is_outside:
                     # Outside bets: yellow text (like inside bets) to indicate selection
@@ -4581,6 +6020,7 @@ class LinupApp:
                         bgcolor=base_color, color='#ffdd00',
                         animation_duration=400,
                         overlay_color={ft.ControlState.PRESSED: ft.Colors.with_opacity(0.4, ft.Colors.WHITE)},
+                        **shape_kwargs,
                     )
                 else:
                     # Inside bets: yellow text + original background
@@ -4588,6 +6028,7 @@ class LinupApp:
                         bgcolor=base_color, color='#ffdd00',
                         animation_duration=400,
                         overlay_color={ft.ControlState.PRESSED: ft.Colors.with_opacity(0.4, ft.Colors.WHITE)},
+                        **shape_kwargs,
                     )
             elif has_sel:
                 # Deselected (others selected): dimmed base color + white text for visibility
@@ -4595,6 +6036,7 @@ class LinupApp:
                 btn.style = ft.ButtonStyle(
                     bgcolor=dimmed_color, color=ft.Colors.WHITE,
                     animation_duration=400,
+                    **shape_kwargs,
                 )
             else:
                 # Unselected (no active): full color with white text
@@ -4602,8 +6044,11 @@ class LinupApp:
                     bgcolor=base_color, color=ft.Colors.WHITE,
                     animation_duration=400,
                     overlay_color={ft.ControlState.PRESSED: ft.Colors.with_opacity(0.4, ft.Colors.WHITE)},
+                    **shape_kwargs,
                 )
             btn.update()
+        # Live-grade the new selection in the AI coach bar.
+        self._refresh_ai_label()
 
     def _live_norm(self, g):
         """In live table mode, map a bare dozen/column to its live (wheel-spread)
@@ -4630,25 +6075,32 @@ class LinupApp:
         active_groups = [g for g in active_groups
                         if g in GRUPOS_MAESTROS]  # make sure group exists
         for num in range(0, 37):
-            count = sum(1 for g in active_groups if num in GRUPOS_MAESTROS[g])
+            count = sum(1 for g in active_groups if num in self._grupo_set(g))
             levels[num] = count
         return levels
 
-    def _compute_intersection(self):
+    def _compute_intersection(self, with_weights=False):
         """Sniper mode: smart intersection across group types, union within types.
-        
+
         Examples:
         - Z0 + ZG (both sectors): UNION of sectors
         - Z0 + ZG + R (sectors + color): (Z0 ∪ ZG) ∩ R
         - Z0 + ZG + 1a + Even: (Z0 ∪ ZG) ∩ (1a) ∩ (Even)
         - 1a + 2a + R: (1a ∪ 2a) ∩ R
+
+        with_weights=True also returns a {num: chip_weight} dict — a number
+        covered by more than one zone WITHIN the same type (e.g. two
+        overlapping Live-Sessions sector zones) stacks chips instead of
+        collapsing to one, mirroring how non-sniper safety levels already
+        count multiplicity. Other types (dozens, columns, waves, thirds)
+        always partition cleanly, so their weight is always 1.
         """
         active_groups = [self._live_norm(g) for g in self.grupos_activos]
         active_groups = [g for g in active_groups
                         if g in GRUPOS_MAESTROS]
         if not active_groups:
-            return set()
-        
+            return (set(), {}) if with_weights else set()
+
         # Categorize groups by type
         def get_group_type(g):
             if g in {'Z0', 'ZG', 'ZP', 'H'}:
@@ -4669,7 +6121,7 @@ class LinupApp:
                 return 'RANGE'
             else:
                 return 'FILTER'
-        
+
         # Group by type
         by_type = {}
         for g in active_groups:
@@ -4677,15 +6129,21 @@ class LinupApp:
             if gtype not in by_type:
                 by_type[gtype] = []
             by_type[gtype].append(g)
-        
-        # Compute union for each type
+
+        # Compute union (and per-number multiplicity) for each type
         type_unions = {}
+        type_weights = {}
         for gtype, groups in by_type.items():
             union = set()
+            weight = {}
             for g in groups:
-                union |= GRUPOS_MAESTROS[g]
+                s = self._grupo_set(g)
+                union |= s
+                for num in s:
+                    weight[num] = weight.get(num, 0) + 1
             type_unions[gtype] = union
-        
+            type_weights[gtype] = weight
+
         # Intersect across types
         result = None
         for gtype, union_set in type_unions.items():
@@ -4694,19 +6152,30 @@ class LinupApp:
             else:
                 result &= union_set
 
-        # 0 has no colour/parity/range, so those filters must not drop it when it
-        # belongs to a base selection (e.g. 3a's wheel-spread, or the Z0 sector).
-        # Mirrors the group design where every 3a_L* variant re-adds 0.
-        base_types   = {'DOZEN', 'COLUMN', 'SECTOR', 'WHEEL', 'WAVE'}
-        only_filters = {'COLOR', 'PARITY', 'RANGE'}
-        present_base   = [u for t, u in type_unions.items() if t in base_types]
-        present_filter = [t for t in type_unions if t in only_filters]
-        if (result is not None and 0 not in result
-                and present_base and present_filter
-                and all(0 in u for u in present_base)):
-            result.add(0)
+        # 0 only ever belongs to the wheel-based types (sector/wheel-third/
+        # wave — each partitions all 37 pockets, so exactly one of their
+        # subgroups always covers 0). Dozens, columns, colour, parity and
+        # range are table-layout bets that structurally can't include 0 (a
+        # live '3a_L*' dozen is the one exception, and it already carries 0
+        # in its own union via wheel-neighbour expansion). None of those
+        # should veto 0 when it's genuinely covered by a selected sector,
+        # wheel-third or wave — e.g. W1 (has 0) ∩ 2a/3a (never do) should
+        # still keep 0. Only a *wheel-based* type that selects away from 0
+        # (e.g. T2, which doesn't cover it) counts as a real veto.
+        WHEEL_TYPES = {'SECTOR', 'WHEEL', 'WAVE'}
+        if result is not None and 0 not in result and type_unions:
+            any_has_zero = any(0 in u for u in type_unions.values())
+            wheel_veto = any(0 not in u for t, u in type_unions.items()
+                              if t in WHEEL_TYPES)
+            if any_has_zero and not wheel_veto:
+                result.add(0)
 
-        return result if result is not None else set()
+        result = result if result is not None else set()
+        if not with_weights:
+            return result
+        weights = {n: max((tw.get(n, 1) for tw in type_weights.values()), default=1)
+                   for n in result}
+        return result, weights
 
     def seleccionar_mixer(self, e):
         g = e.control.data['name']
@@ -4940,7 +6409,7 @@ class LinupApp:
             on_ready_cb()
 
         _chip_lbl = ft.Text(
-            f"${chip_per_num:.2f}/num",
+            f"{self._fmt_chip_plain(chip_per_num)}/num",
             color='#f1c40f', size=13,
             weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
@@ -4960,7 +6429,7 @@ class LinupApp:
 
         # For outside bets: show only total (no breakdown)
         _total_lbl = ft.Text(
-            f"Total: ${total_cost:.2f}",
+            f"Total: {self._fmt_chip(total_cost)}",
             color='#ecf0f1', size=12, weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
         )
@@ -4975,8 +6444,8 @@ class LinupApp:
                     self.fixed_multi = mx
                     _c  = _outside_chip * mx
                     _t  = len(self.grupos_activos) * _c  # num groups × chip_per_group
-                    _chip_lbl.value  = f"${_c:.2f}/num"
-                    _total_lbl.value = f"Total: ${_t:.2f}"
+                    _chip_lbl.value  = f"{self._fmt_chip_plain(_c)}/num"
+                    _total_lbl.value = f"Total: {self._fmt_chip(_t)}"
                     for k, b in _pmx_refs.items():
                         b.style = ft.ButtonStyle(
                             bgcolor='#f39c12' if k == mx else '#3a3a3a',
@@ -5110,18 +6579,15 @@ class LinupApp:
     
     def _show_inside_bet_popup(self, on_ready_cb):
         """Show popup with roulette grid and outside betting table for inside bets."""
-        intersection = self._compute_intersection()
-
         if self.sniper_mode:
-            all_nums    = intersection
-            safety_levels = {n: 1 for n in all_nums}
-            total_chips = len(all_nums)
+            all_nums, safety_levels = self._compute_intersection(with_weights=True)
+            total_chips = sum(safety_levels.values())
         else:
             all_nums: set = set()
             for g in self.grupos_activos:
                 g = self._live_norm(g)
                 if g in GRUPOS_MAESTROS:
-                    all_nums |= GRUPOS_MAESTROS[g]
+                    all_nums |= self._grupo_set(g)
             safety_levels = self._compute_safety_levels()
             total_chips = sum(v for v in safety_levels.values() if v > 0)
             max_safety = max((v for v in safety_levels.values() if v > 0), default=0)
@@ -5189,7 +6655,10 @@ class LinupApp:
         def get_border_color(num):
             """Return border color based on safety level."""
             if self.sniper_mode:
-                return '#ffdd00'  # Yellow for sniper ON intersection
+                # Overlapping zones (e.g. Live Sessions ZP+H sharing a
+                # number) stack chips — flag those with magenta, single
+                # chip stays yellow.
+                return '#ff00ff' if safety_levels.get(num, 1) >= 2 else '#ffdd00'
             else:
                 # Sniper OFF: color by safety level
                 sl = safety_levels.get(num, 0)
@@ -5320,7 +6789,7 @@ class LinupApp:
             on_ready_cb()
 
         _chip_lbl = ft.Text(
-            f"${chip_per_num:.2f}/num",
+            f"{self._fmt_chip_plain(chip_per_num)}/num",
             color='#f1c40f', size=13,
             weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
@@ -5340,7 +6809,7 @@ class LinupApp:
 
         # For inside bets: show total + breakdown with total chips count
         _total_lbl = ft.Text(
-            f"Total: ${total_cost:.2f}  ({total_chips} × ${chip_per_num:.2f})",
+            f"Total: {self._fmt_chip(total_cost)}  ({total_chips} × {self._fmt_chip_plain(chip_per_num)})",
             color='#ecf0f1', size=12, weight=ft.FontWeight.BOLD,
             text_align=ft.TextAlign.CENTER,
         )
@@ -5353,8 +6822,8 @@ class LinupApp:
                 self.fixed_multi = mx
                 _c  = self.val_fin * mx
                 _t  = total_chips * _c
-                _chip_lbl.value  = f"${_c:.2f}/num"
-                _total_lbl.value = f"Total: ${_t:.2f}  ({total_chips} × ${_c:.2f})"
+                _chip_lbl.value  = f"{self._fmt_chip_plain(_c)}/num"
+                _total_lbl.value = f"Total: {self._fmt_chip(_t)}  ({total_chips} × {self._fmt_chip_plain(_c)})"
                 for k, b in _pmx_refs.items():
                     b.style = ft.ButtonStyle(
                         bgcolor='#f39c12' if k == mx else '#3a3a3a',
@@ -5462,6 +6931,16 @@ class LinupApp:
             # No outside bets, just show roulette grid centered
             main_content = grid
         
+        overlap_controls = []
+        if self.sniper_mode and any(v >= 2 for v in safety_levels.values()):
+            overlap_controls.append(
+                ft.Text(
+                    "Magenta = 2x chips (overlapping zones)",
+                    color='#ff00ff', size=10, weight=ft.FontWeight.BOLD,
+                    text_align=ft.TextAlign.CENTER,
+                )
+            )
+
         dlg.content = ft.Column(
             tight=True,
             scroll=ft.ScrollMode.AUTO,
@@ -5471,7 +6950,7 @@ class LinupApp:
                 main_content,
                 ft.Container(height=8),
                 _total_lbl,
-            ] + popup_extra,
+            ] + overlap_controls + popup_extra,
         )
         dlg.actions = [
             ft.ElevatedButton(
@@ -5496,6 +6975,47 @@ class LinupApp:
         self.update_inv_label()
         self.lbl_inv.update()
         self.update_ui()   # immediately reflect pending bet in P/L
+
+        # AI: snapshot the board setup + the combination the player chose, so we
+        # can grade it once the spin result is in (see process_number).
+        if getattr(self, 'ai_ok', False) and self.grupos_activos:
+            try:
+                self.current_choice = self.strategy_model.capture_choice(
+                    self.history_nums, self.grupos_activos)
+                if getattr(self, 'decision_tracker', None):
+                    total_cost, _, _ = self._compute_bet()
+                    self.current_decision_id = str(uuid.uuid4())
+                    self.decision_tracker.record_decision(Decision(
+                        decision_id=self.current_decision_id,
+                        session_id=str(self.session_id or 0),
+                        spin_number=len(self.history_nums),
+                        bet_target=self.current_choice['combo'],
+                        bet_type='group' if len(self.grupos_activos) > 1 else 'number',
+                        bet_amount=total_cost,
+                        decision_context={
+                            'signature': self.current_choice['signature'],
+                            'features': self.current_choice['features'],
+                        },
+                        source='manual',
+                        decision_time=datetime.now(),
+                        spin_result=None,
+                        outcome='pending',
+                        profit_loss=None,
+                    ))
+            except Exception:
+                self.current_choice = None
+
+    def _activate_tune(self):
+        """TUNE: arm the same selection as a practice pick — no bank impact,
+        no MAX LOSS warning, no AI decision logging. Resolved in
+        process_number exactly like a real bet, just scored into
+        tune_hits/tune_total instead of the bank."""
+        self.tune_activa = True
+        self.btn_tune.style = ft.ButtonStyle(bgcolor='#3498db', color=ft.Colors.WHITE,
+                                             animation_duration=400)
+        self.btn_tune.update()
+        self.update_inv_label()
+        self.lbl_inv.update()
 
     def _check_pre_bet_warning(self, on_confirm):
         """Show warning if losing this bet would breach the configured MAX LOSS."""
@@ -5534,7 +7054,7 @@ class LinupApp:
                 ft.Divider(color='#444444'),
                 ft.Text("If you lose this bet:", color=ft.Colors.WHITE, size=13),
                 ft.Container(height=4),
-                ft.Text(f"Bank: ${potential_bank:.2f}", color='#ff4444',
+                ft.Text(f"Bank: {self._fmt_bank(potential_bank)}", color='#ff4444',
                         size=18, weight=ft.FontWeight.BOLD),
                 ft.Text(f"Loss: {loss_pct*100:.1f}%  (MAX LOSS {max_loss_frac*100:.1f}%)",
                         color='#ff4444', size=13),
@@ -5584,10 +7104,17 @@ class LinupApp:
         )
 
     def confirmar_manual(self, e=None):
-        if not self.grupos_activos:
+        if not self.grupos_activos or self.tune_activa:
             return
         # Warning popup before the chip/table setup popup
         self._proceed_bet()
+
+    def confirmar_tune(self, e=None):
+        """TUNE: same selection popup as INVEST, but no MAX LOSS warning and
+        no bank impact — just scores the pick once the next number lands."""
+        if not self.grupos_activos or self.activa:
+            return
+        self._show_roulette_chip_popup(self._activate_tune)
 
     def auto_invertir_sug(self, grupos):
         self.limpiar_seleccion_visual()
@@ -5595,6 +7122,97 @@ class LinupApp:
         self._refresh_mixer_colors()
         # Warning popup before the chip/table setup popup
         self._proceed_bet()
+
+    # ──────────────────────────────────────────────────────────────────
+    # AI COMBINATION COACH
+    # ──────────────────────────────────────────────────────────────────
+    def _get_ai_info_display(self) -> str:
+        """One-line coach text: learning progress, live bet grade, or a tip."""
+        if not getattr(self, 'ai_ok', False):
+            return "AI: off"
+        # In live table mode the RVS colour-regime read is the headline —
+        # this is the overlay that actually colours the dozen suggestion.
+        if getattr(self, 'live_table_mode', False):
+            try:
+                txt = regime_status(self.history_nums)
+                if getattr(self, 'entry_policy', None):
+                    kind = _regime(self.history_nums)[1]
+                    txt = ("[ENTER] " if kind in self.entry_policy
+                           else "[SKIP] ") + txt
+                return "AI 🧠 " + txt
+            except Exception:
+                pass
+        try:
+            obs = self.strategy_model.total_observations()
+            if obs < MIN_TRAINED_OBS:
+                remaining = MIN_TRAINED_OBS - obs
+                return (f"AI 🧠 learning your style — {remaining} more graded "
+                        f"bets ({obs}/{MIN_TRAINED_OBS})")
+
+            ready = len(self.history_nums) >= 6
+            # Live grade of the combination currently selected.
+            if ready and self.grupos_activos:
+                res = self.strategy_model.score(self.history_nums, self.grupos_activos)
+                if res.get('win_prob') is not None:
+                    return (f"AI 🧠 {res['combo']}: {res['win_prob']:.0%} "
+                            f"· {res['verdict']}")
+            # No selection yet → is this board a line-up you usually enter on?
+            if ready:
+                setup = self.strategy_model.setup_readiness(self.history_nums)
+                rec = self.strategy_model.recommend(self.history_nums)
+                rec_txt = ""
+                if rec and rec.get('win_prob') is not None:
+                    rec_txt = f" · {rec['combo']} {rec['win_prob']:.0%}"
+                # Adaptive wait hint: how long you usually line up vs now.
+                avg_wait = self.strategy_model.typical_wait()
+                wait_txt = ""
+                if avg_wait is not None:
+                    wait_txt = f" · waited {self.spins_since_entry}/~{avg_wait:.0f}"
+                if setup.get('status') == 'ok':
+                    return f"AI 🧠 {setup['label']}{rec_txt}{wait_txt}"
+                if rec_txt:
+                    return f"AI 🧠 try{rec_txt.replace(' · ', ' ', 1)}{wait_txt}"
+                if wait_txt:
+                    return f"AI 🧠 lining up{wait_txt}"
+            a = self.strategy_model.analyze()
+            if a.get('status') == 'ok':
+                return (f"AI 🧠 your combo win rate {a['overall_win_rate']:.0%} "
+                        f"over {a['total']} bets")
+            return "AI 🧠 active"
+        except Exception:
+            return "AI 🧠 active"
+
+    def _refresh_ai_label(self):
+        """Update the AI coach bar in place (safe to call anytime)."""
+        if not getattr(self, 'ai_ok', False):
+            return
+        lbl = getattr(self, 'lbl_ai_info', None)
+        if lbl is None:
+            return
+        try:
+            lbl.value = self._get_ai_info_display()
+            lbl.update()
+        except Exception:
+            pass
+
+    def _get_tune_info_display(self) -> str:
+        """TUNE row: running hit-rate from practice selections (no bank impact)."""
+        total = getattr(self, 'tune_total', 0)
+        hits  = getattr(self, 'tune_hits', 0)
+        if total == 0:
+            return "TUNE: —"
+        return f"TUNE: {hits / total * 100:.0f}%  ({hits}/{total})"
+
+    def _refresh_tune_label(self):
+        """Update the TUNE hit-rate row in place (safe to call anytime)."""
+        lbl = getattr(self, 'lbl_tune_info', None)
+        if lbl is None:
+            return
+        try:
+            lbl.value = self._get_tune_info_display()
+            lbl.update()
+        except Exception:
+            pass
 
     # ──────────────────────────────────────────────────────────────────
     # SUGGESTIONS
@@ -5635,6 +7253,7 @@ class LinupApp:
                 for _ in range(n_cats)
             ]
             self.sug_row.update()
+            self._refresh_ai_label()   # keep "watching N/6" counting up
             return
 
         def _sug_content(label):
@@ -5649,6 +7268,12 @@ class LinupApp:
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 )
             return self._txt(label, size=12)
+
+        def _sug_expand(label):
+            # Two-group combos ("A+B") need more room than a short single
+            # label ("---", "WAIT", a lone group code) — same 7:8 ratio as
+            # the Even/Odd vs High/Low split in the filter row below.
+            return 8 if '+' in label else 7
 
         live = getattr(self, 'live_table_mode', False)
         lf   = getattr(self, 'live_filter', None)   # e.g. None, 'R', 'B', '1-18', …
@@ -5685,16 +7310,29 @@ class LinupApp:
                     bg    = '#34495e'
                     click = None
                 else:
-                    top      = stats[0]['g']
-                    actual_g = f'{top}{_DOC_SFX.get(lf, "_L")}'
-                    ftag     = _FILTER_LABELS[lf] if lf else ''
+                    top = stats[0]['g']
+                    # AI colour overlay: when no manual filter is set, colour the
+                    # dozen with the croupier's current colour regime (RVS:
+                    # bias / streak / rhythm — see regime_color). Best risk-adjusted
+                    # picker under the 1x-2x-3x combo progression + 2% cap
+                    # (ai_combo_eval.py). cond_color_for(top, self.history_nums) is
+                    # the retired COND fallback, kept for A/B comparison.
+                    rcol = None
+                    if lf is None and getattr(self, 'ai_ok', False):
+                        try:
+                            rcol = regime_color(self.history_nums)
+                        except Exception:
+                            rcol = None
+                    eff_filter = lf if lf is not None else rcol
+                    actual_g = f'{top}{_DOC_SFX.get(eff_filter, "_L")}'
+                    ftag     = _FILTER_LABELS[eff_filter] if eff_filter else ''
                     label    = f'{top}+{ftag}' if ftag else top
                     bg       = color if stats[0]['p'] > 0 else '#34495e'
                     click    = self._make_sug_handler([actual_g])
                 new_btns.append(
                     ft.ElevatedButton(
                         content=_sug_content(label),
-                        expand=True, height=40,
+                        expand=_sug_expand(label), height=40,
                         on_click=click,
                         style=ft.ButtonStyle(bgcolor=bg, color=ft.Colors.WHITE),
                     )
@@ -5718,7 +7356,7 @@ class LinupApp:
                 new_btns.append(
                     ft.ElevatedButton(
                         content=_sug_content(label),
-                        expand=True, height=40,
+                        expand=_sug_expand(label), height=40,
                         on_click=click,
                         style=ft.ButtonStyle(bgcolor=bg, color=ft.Colors.WHITE),
                     )
@@ -5742,7 +7380,7 @@ class LinupApp:
             new_btns.append(
                 ft.ElevatedButton(
                     content=_sug_content(label),
-                    expand=True, height=40,
+                    expand=_sug_expand(label), height=40,
                     on_click=click,
                     style=ft.ButtonStyle(bgcolor=bg, color=ft.Colors.WHITE),
                 )
@@ -5750,6 +7388,7 @@ class LinupApp:
 
         self.sug_row.controls = new_btns
         self.sug_row.update()
+        self._refresh_ai_label()
 
     # ──────────────────────────────────────────────────────────────────
 
@@ -5758,6 +7397,10 @@ class LinupApp:
             self.btn_inv.style = ft.ButtonStyle(bgcolor='#2ecc71', color=ft.Colors.WHITE,
                                                 animation_duration=400)
             self.btn_inv.update()
+        if getattr(self, 'btn_tune', None):
+            self.btn_tune.style = ft.ButtonStyle(bgcolor='#8e44ad', color=ft.Colors.WHITE,
+                                                 animation_duration=400)
+            self.btn_tune.update()
         self.grupos_activos = []
         self._refresh_mixer_colors()
         self.update_inv_label()
@@ -5774,7 +7417,7 @@ class LinupApp:
             
             # Outside bets: show only total cost, no chip breakdown
             if is_simple_outside:
-                self.lbl_inv.value = f"BET: ${total:.2f}"
+                self.lbl_inv.value = f"BET: {self._fmt_chip(total)}"
             else:
                 # Inside bets: show chip breakdown with actual per-number cost
                 if self.sniper_mode and self.prog_on and num_chips > 0:
@@ -5783,9 +7426,11 @@ class LinupApp:
                     effective_multi = multi
                 chip_val = self.val_fin * effective_multi
                 prog_tag = "" if self.prog_on else f" [{multi}x]"
-                self.lbl_inv.value = f"BET: ${total:.2f} ({num_chips}x${chip_val:.4g}){prog_tag}"
+                chip_str = (f"{chip_val:.4g} chips" if self.inv_type == 'CHIPS'
+                            else f"${chip_val:.4g}")
+                self.lbl_inv.value = f"BET: {self._fmt_chip(total)} ({num_chips}x{chip_str}){prog_tag}"
         else:
-            self.lbl_inv.value = "BET: $0.00"
+            self.lbl_inv.value = f"BET: {self._fmt_chip(0)}"
 
     def update_ui(self):
         if not self.lbl_bank:
@@ -5817,10 +7462,28 @@ class LinupApp:
             self.limpiar_seleccion_visual()
             self.update_ui()
             return
+        # Same, for a pending TUNE pick — nothing was scored yet, just cancel it.
+        if self.tune_activa:
+            self.tune_activa = False
+            self.limpiar_seleccion_visual()
+            self.update_ui()
+            return
         if self.history_nums:
             self.history_nums.pop()
             if self.sliding_window:
                 self.sliding_window.pop()
+            # Predictors are incremental — rebuild them from the corrected history.
+            if getattr(self, 'ai_ok', False):
+                if getattr(self, 'rhythm_model', None):
+                    try:
+                        self.rhythm_model.observe_sequence(self.history_nums)
+                    except Exception:
+                        pass
+                if getattr(self, 'pattern_model', None):
+                    try:
+                        self.pattern_model.observe_sequence(self.history_nums)
+                    except Exception:
+                        pass
             # Reverse bank
             self.banca_actual -= self.last_bank_delta
             self.last_bank_delta = 0.0
@@ -5838,6 +7501,13 @@ class LinupApp:
                         self.nivel_martingala_in -= 1
             self.last_bet_outside = None
             self.last_prog_state  = True
+            # Reverse a TUNE resolution if that's what the undone number was
+            if getattr(self, 'last_was_tune', False):
+                self.tune_total = max(0, self.tune_total - 1)
+                if self.last_tune_hit:
+                    self.tune_hits = max(0, self.tune_hits - 1)
+                self.last_was_tune = False
+                self._refresh_tune_label()
             self.update_registration_table()
             self.update_ui()
 
