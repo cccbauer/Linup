@@ -1,6 +1,6 @@
 [project]
 name = "Linup"
-version = "19.1.21-AI"
+version = "19.1.22-AI"
 description = "Linup Roulette Tracker - AI Edition"
 requires-python = ">=3.10"
 dependencies = ["flet==0.80.5", "reportlab>=4.0.0"]
@@ -16,3 +16,10 @@ bundle_id = "com.linup.app"
 
 [tool.flet.macos]
 minimum_version = "12.0"
+
+# Disable the native Android splash (a static frame of the app icon shown
+# while the engine boots) so the app goes straight into its own animated
+# in-app splash (show_splash() in main.py, the roulette.gif) with no
+# static flash beforehand.
+[tool.flet.splash]
+android = false
